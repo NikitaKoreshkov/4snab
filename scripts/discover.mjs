@@ -12,7 +12,11 @@ if (!subdomain || !token) {
   process.exit(1);
 }
 
-const base = `https://${subdomain}.amocrm.ru`;
+const host = subdomain
+  .trim()
+  .replace(/^https?:\/\//, "")
+  .replace(/\/.*$/, "");
+const base = `https://${host.includes(".") ? host : `${host}.amocrm.ru`}`;
 
 async function amo(path) {
   const res = await fetch(new URL(path, base), {

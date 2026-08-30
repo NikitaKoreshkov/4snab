@@ -64,7 +64,7 @@ export default async function RequestPage({
       <RequestForm
         token={token}
         id={request.id}
-        quantity={request.quantity}
+        initialQuantity={request.quantity}
         initialUnitPrice={request.unitPrice}
         initialDeliveryCost={request.deliveryCost}
         isDone={request.isDone}

@@ -14,16 +14,22 @@ function opt(name: string): string | undefined {
   return process.env[name] || undefined;
 }
 
+/** Принимает "company", "company.amocrm.ru" или "https://company.amocrm.ru" → "company.amocrm.ru". */
+export function normalizeAmoHost(value: string): string {
+  const raw = value
+    .trim()
+    .replace(/^https?:\/\//, "")
+    .replace(/\/.*$/, "");
+  return raw.includes(".") ? raw : `${raw}.amocrm.ru`;
+}
+
 export const env = {
   amocrm: {
-    get subdomain() {
-      return req("AMOCRM_SUBDOMAIN");
-    },
     get accessToken() {
       return req("AMOCRM_ACCESS_TOKEN");
     },
     get baseUrl() {
-      return `https://${req("AMOCRM_SUBDOMAIN")}.amocrm.ru`;
+      return `https://${normalizeAmoHost(req("AMOCRM_SUBDOMAIN"))}`;
     },
   },
   pipelines: {
@@ -43,38 +49,39 @@ export const env = {
       return opt("AMOCRM_SKLAD_DONE_STATUS_ID");
     },
   },
+  // Кастомные поля сделок в amoCRM общие для всех воронок,
+  // поэтому одни и те же ID и для чтения из «Диспетчера», и для записи в «Склад».
   fields: {
-    dispatch: {
-      get shipDate() {
-        return opt("AMOCRM_DISPATCH_FIELD_SHIP_DATE");
-      },
-      get company() {
-        return opt("AMOCRM_DISPATCH_FIELD_COMPANY");
-      },
-      get quantity() {
-        return opt("AMOCRM_DISPATCH_FIELD_QUANTITY");
-      },
+    get shipDate() {
+      return opt("AMOCRM_FIELD_SHIP_DATE");
     },
-    sklad: {
-      get shipDate() {
-        return opt("AMOCRM_SKLAD_FIELD_SHIP_DATE");
-      },
-      get company() {
-        return opt("AMOCRM_SKLAD_FIELD_COMPANY");
-      },
-      get quantity() {
-        return opt("AMOCRM_SKLAD_FIELD_QUANTITY");
-      },
-      get unitPrice() {
-        return opt("AMOCRM_SKLAD_FIELD_UNIT_PRICE");
-      },
-      get deliveryCost() {
-        return opt("AMOCRM_SKLAD_FIELD_DELIVERY_COST");
-      },
-      get budget() {
-        return opt("AMOCRM_SKLAD_FIELD_BUDGET");
-      },
+    get company() {
+      return opt("AMOCRM_FIELD_COMPANY");
     },
+    get quantity() {
+      return opt("AMOCRM_FIELD_QUANTITY");
+    },
+    get unitPrice() {
+      return opt("AMOCRM_FIELD_UNIT_PRICE");
+    },
+    get deliveryCost() {
+      return opt("AMOCRM_FIELD_DELIVERY_COST");
+    },
+    get budget() {
+      return opt("AMOCRM_FIELD_BUDGET");
+    },
+    get waybill() {
+      return opt("AMOCRM_FIELD_WAYBILL");
+    },
+    get waybillPhoto() {
+      return opt("AMOCRM_FIELD_WAYBILL_PHOTO");
+    },
+    get sourceLead() {
+      return opt("AMOCRM_FIELD_SOURCE_LEAD");
+    },
+  },
+  get processedTag() {
+    return opt("AMOCRM_PROCESSED_TAG") ?? "Склад: заявка создана";
   },
   get webhookSecret() {
     return opt("AMOCRM_WEBHOOK_SECRET");

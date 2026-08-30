@@ -8,6 +8,11 @@ import { saveRequest } from "@/lib/requests";
 const schema = z.object({
   token: z.string().min(8),
   id: z.coerce.number().int().positive(),
+  quantity: z
+    .string()
+    .optional()
+    .transform((v) => (v && v.trim() !== "" ? Number(v) : null))
+    .refine((v) => v === null || (Number.isFinite(v) && v >= 0), "Некорректное количество"),
   unitPrice: z.coerce.number().min(0),
   deliveryCost: z.coerce.number().min(0),
   markDone: z
@@ -28,6 +33,7 @@ export async function saveRequestAction(
   const parsed = schema.safeParse({
     token: formData.get("token"),
     id: formData.get("id"),
+    quantity: formData.get("quantity") ?? "",
     unitPrice: formData.get("unitPrice"),
     deliveryCost: formData.get("deliveryCost"),
     markDone: formData.get("markDone") ?? "",
@@ -37,13 +43,13 @@ export async function saveRequestAction(
     return { ok: false, error: "Проверьте правильность заполнения полей" };
   }
 
-  const { token, id, unitPrice, deliveryCost, markDone } = parsed.data;
+  const { token, id, quantity, unitPrice, deliveryCost, markDone } = parsed.data;
   if (!getUserByToken(token)) {
     return { ok: false, error: "Доступ запрещён" };
   }
 
   try {
-    await saveRequest(id, { unitPrice, deliveryCost, markDone });
+    await saveRequest(id, { quantity, unitPrice, deliveryCost, markDone });
   } catch (err) {
     console.error("saveRequestAction", err);
     return { ok: false, error: "Не удалось сохранить в amoCRM. Попробуйте ещё раз." };

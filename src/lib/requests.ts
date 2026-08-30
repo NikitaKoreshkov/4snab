@@ -2,8 +2,10 @@
 import "server-only";
 import { env, requireId } from "./env";
 import {
+  addLeadTag,
   createLead,
   getLead,
+  leadHasTag,
   linkLeads,
   listLeadsByPipeline,
   readFieldValue,
@@ -38,13 +40,26 @@ function str(value: unknown): string | null {
   return s || null;
 }
 
-/** amoCRM отдаёт даты кастомных полей как unix-таймстамп (сек). */
+/**
+ * amoCRM отдаёт даты кастомных полей как unix-таймстамп (сек) на 00:00 в таймзоне
+ * аккаунта. Сдвигаем на 12 часов, чтобы не словить off-by-one при переводе в UTC-дату.
+ */
 function dateStr(value: unknown): string | null {
   if (value === null || value === undefined || value === "") return null;
   const n = Number(value);
-  const d = Number.isFinite(n) ? new Date(n * 1000) : new Date(String(value));
+  const d = Number.isFinite(n)
+    ? new Date(n * 1000 + 12 * 3600 * 1000)
+    : new Date(String(value));
   if (Number.isNaN(d.getTime())) return null;
   return d.toISOString().slice(0, 10);
+}
+
+function fieldId(value: string | undefined): number | null {
+  return value ? Number(value) : null;
+}
+
+function read(lead: AmoLead, id: number | null): unknown {
+  return id ? readFieldValue(lead, id) : null;
 }
 
 export function calcBudget(
@@ -57,19 +72,16 @@ export function calcBudget(
 }
 
 function toShipmentRequest(lead: AmoLead): ShipmentRequest {
-  const f = env.fields.sklad;
-  const quantity = num(f.quantity ? readFieldValue(lead, Number(f.quantity)) : null);
-  const unitPrice = num(f.unitPrice ? readFieldValue(lead, Number(f.unitPrice)) : null);
-  const deliveryCost = num(
-    f.deliveryCost ? readFieldValue(lead, Number(f.deliveryCost)) : null,
-  );
-  const storedBudget = num(f.budget ? readFieldValue(lead, Number(f.budget)) : null);
+  const quantity = num(read(lead, fieldId(env.fields.quantity)));
+  const unitPrice = num(read(lead, fieldId(env.fields.unitPrice)));
+  const deliveryCost = num(read(lead, fieldId(env.fields.deliveryCost)));
+  const storedBudget = num(read(lead, fieldId(env.fields.budget)));
 
   return {
     id: lead.id,
     name: lead.name,
-    shipDate: f.shipDate ? dateStr(readFieldValue(lead, Number(f.shipDate))) : null,
-    company: f.company ? str(readFieldValue(lead, Number(f.company))) : null,
+    shipDate: dateStr(read(lead, fieldId(env.fields.shipDate))),
+    company: str(read(lead, fieldId(env.fields.company))),
     quantity,
     unitPrice,
     deliveryCost,
@@ -101,6 +113,8 @@ export async function getRequest(id: number): Promise<ShipmentRequest> {
 
 // ── Создание из сделки диспетчера (вызывается вебхуком) ───────────────
 
+type Cfv = { field_id: number; values: { value: unknown }[] };
+
 export async function createSkladRequestFromDispatch(
   dispatchLeadId: number,
 ): Promise<ShipmentRequest> {
@@ -112,49 +126,62 @@ export async function createSkladRequestFromDispatch(
   );
 
   const src = await getLead(dispatchLeadId);
-  const df = env.fields.dispatch;
-  const sf = env.fields.sklad;
 
-  const shipDateRaw = df.shipDate ? readFieldValue(src, Number(df.shipDate)) : null;
-  const companyRaw = df.company ? readFieldValue(src, Number(df.company)) : null;
-  const quantityRaw = df.quantity ? readFieldValue(src, Number(df.quantity)) : null;
+  // Переносим в складскую сделку то, что уже заполнено диспетчером.
+  const carryOver: Cfv[] = [];
+  for (const id of [
+    fieldId(env.fields.shipDate),
+    fieldId(env.fields.company),
+    fieldId(env.fields.quantity),
+  ]) {
+    if (!id) continue;
+    const value = readFieldValue(src, id);
+    if (value !== null && value !== undefined && value !== "") {
+      carryOver.push({ field_id: id, values: [{ value }] });
+    }
+  }
 
-  const customFields: { field_id: number; values: { value: unknown }[] }[] = [];
-  if (sf.shipDate && shipDateRaw != null)
-    customFields.push({ field_id: Number(sf.shipDate), values: [{ value: shipDateRaw }] });
-  if (sf.company && companyRaw != null)
-    customFields.push({ field_id: Number(sf.company), values: [{ value: companyRaw }] });
-  if (sf.quantity && quantityRaw != null)
-    customFields.push({ field_id: Number(sf.quantity), values: [{ value: quantityRaw }] });
+  // ссылка на исходную сделку — для отчёта «Табель отгрузки» и защиты от дублей
+  const sourceFieldId = fieldId(env.fields.sourceLead);
+  if (sourceFieldId) {
+    carryOver.push({ field_id: sourceFieldId, values: [{ value: dispatchLeadId }] });
+  }
 
   const created = await createLead({
     name: src.name || `Отгрузка #${dispatchLeadId}`,
     pipeline_id: skladPipelineId,
     status_id: newStatusId,
-    custom_fields_values: customFields.length ? customFields : undefined,
+    custom_fields_values: carryOver.length ? carryOver : undefined,
   });
 
+  // пометить сделку диспетчера как обработанную (для дедупликации вебхука)
+  try {
+    await addLeadTag(dispatchLeadId, env.processedTag);
+  } catch {
+    // некритично
+  }
+  // нативная связь сделок (может быть недоступна в аккаунте — не критично)
   try {
     await linkLeads(created.id, dispatchLeadId);
   } catch {
-    // связывание не критично для работы веб-инструмента
+    /* noop */
   }
 
   return toShipmentRequest(await getLead(created.id));
 }
 
-/** Уже есть складская сделка, связанная с этой сделкой диспетчера? */
+/**
+ * Уже создавалась складская сделка для этой сделки диспетчера?
+ * Проверяем по тегу на сделке диспетчера — это чтение по ID, без задержек индексации.
+ */
 export async function skladRequestExistsFor(dispatchLeadId: number): Promise<boolean> {
-  const pipelineId = Number(requireId(env.pipelines.skladId, "AMOCRM_SKLAD_PIPELINE_ID"));
-  const leads = await listLeadsByPipeline(pipelineId);
-  const src = await getLead(dispatchLeadId);
-  // эвристика: совпадение имени. Точную связь можно проверять через /links.
-  return leads.some((l) => l.name === src.name);
+  return leadHasTag(dispatchLeadId, env.processedTag);
 }
 
 // ── Сохранение зав.складом ───────────────────────────────────────────
 
 export interface SaveRequestInput {
+  quantity: number | null;
   unitPrice: number;
   deliveryCost: number;
   markDone: boolean;
@@ -165,23 +192,22 @@ export async function saveRequest(
   input: SaveRequestInput,
 ): Promise<ShipmentRequest> {
   const current = await getRequest(id);
-  const sf = env.fields.sklad;
+  const quantity = input.quantity ?? current.quantity;
+  const budget = calcBudget(quantity, input.unitPrice, input.deliveryCost);
 
-  const budget = calcBudget(current.quantity, input.unitPrice, input.deliveryCost);
-
-  const customFields: { field_id: number; values: { value: unknown }[] }[] = [];
-  if (sf.unitPrice)
-    customFields.push({ field_id: Number(sf.unitPrice), values: [{ value: input.unitPrice }] });
-  if (sf.deliveryCost)
-    customFields.push({
-      field_id: Number(sf.deliveryCost),
-      values: [{ value: input.deliveryCost }],
-    });
-  if (sf.budget && budget !== null)
-    customFields.push({ field_id: Number(sf.budget), values: [{ value: budget }] });
+  const cfv: Cfv[] = [];
+  const push = (fid: number | null, value: unknown) => {
+    if (fid && value !== null && value !== undefined) {
+      cfv.push({ field_id: fid, values: [{ value }] });
+    }
+  };
+  push(fieldId(env.fields.quantity), input.quantity);
+  push(fieldId(env.fields.unitPrice), input.unitPrice);
+  push(fieldId(env.fields.deliveryCost), input.deliveryCost);
+  push(fieldId(env.fields.budget), budget);
 
   await updateLead(id, {
-    custom_fields_values: customFields.length ? customFields : undefined,
+    custom_fields_values: cfv.length ? cfv : undefined,
     status_id:
       input.markDone && env.pipelines.skladDoneStatusId
         ? Number(env.pipelines.skladDoneStatusId)

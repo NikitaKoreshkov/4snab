@@ -22,6 +22,7 @@ export interface AmoLead {
   _embedded?: {
     companies?: { id: number }[];
     contacts?: { id: number }[];
+    tags?: { id: number; name: string }[];
   };
 }
 
@@ -86,21 +87,20 @@ async function amoFetch<T>(
 // ── Справочники ────────────────────────────────────────────────────────
 
 export async function getPipelines(): Promise<AmoPipeline[]> {
-  const data = await amoFetch<{ _embedded?: { pipelines: AmoPipeline[] } }>(
+  const data = await amoFetch<{ _embedded?: { pipelines: AmoPipeline[] } } | undefined>(
     "/api/v4/leads/pipelines",
   );
-  return data._embedded?.pipelines ?? [];
+  return data?._embedded?.pipelines ?? [];
 }
 
 export async function getLeadCustomFields(): Promise<AmoCustomField[]> {
   const out: AmoCustomField[] = [];
   let page = 1;
   for (;;) {
-    const data = await amoFetch<{ _embedded?: { custom_fields: AmoCustomField[] } }>(
-      "/api/v4/leads/custom_fields",
-      { query: { page, limit: 250 } },
-    );
-    const chunk = data._embedded?.custom_fields ?? [];
+    const data = await amoFetch<
+      { _embedded?: { custom_fields: AmoCustomField[] } } | undefined
+    >("/api/v4/leads/custom_fields", { query: { page, limit: 250 } });
+    const chunk = data?._embedded?.custom_fields ?? [];
     out.push(...chunk);
     if (chunk.length < 250) break;
     page += 1;
@@ -123,17 +123,20 @@ export async function listLeadsByPipeline(
   const out: AmoLead[] = [];
   let page = 1;
   for (;;) {
-    const data = await amoFetch<{ _embedded?: { leads: AmoLead[] } }>("/api/v4/leads", {
-      query: {
-        "filter[pipeline_id]": pipelineId,
-        "filter[statuses][0][pipeline_id]": statusId ? pipelineId : undefined,
-        "filter[statuses][0][status_id]": statusId,
-        with: "companies,contacts",
-        page,
-        limit: 250,
+    const data = await amoFetch<{ _embedded?: { leads: AmoLead[] } } | undefined>(
+      "/api/v4/leads",
+      {
+        query: {
+          "filter[pipeline_id]": pipelineId,
+          "filter[statuses][0][pipeline_id]": statusId ? pipelineId : undefined,
+          "filter[statuses][0][status_id]": statusId,
+          with: "companies,contacts",
+          page,
+          limit: 250,
+        },
       },
-    });
-    const chunk = data._embedded?.leads ?? [];
+    );
+    const chunk = data?._embedded?.leads ?? [];
     out.push(...chunk);
     if (chunk.length < 250) break;
     page += 1;
@@ -159,6 +162,7 @@ export async function createLead(input: CreateLeadInput): Promise<AmoLead> {
 export interface UpdateLeadInput {
   status_id?: number;
   custom_fields_values?: { field_id: number; values: { value: unknown }[] }[];
+  _embedded?: { tags: ({ id: number } | { name: string })[] };
 }
 
 export async function updateLead(id: number, input: UpdateLeadInput): Promise<void> {
@@ -168,12 +172,39 @@ export async function updateLead(id: number, input: UpdateLeadInput): Promise<vo
   });
 }
 
+/** Добавляет тег сделке, не затирая существующие. */
+export async function addLeadTag(id: number, tagName: string): Promise<void> {
+  const lead = await getLead(id);
+  const current = lead._embedded?.tags ?? [];
+  if (current.some((t) => t.name === tagName)) return;
+  await updateLead(id, {
+    _embedded: { tags: [...current.map((t) => ({ id: t.id })), { name: tagName }] },
+  });
+}
+
+export async function leadHasTag(id: number, tagName: string): Promise<boolean> {
+  const lead = await getLead(id);
+  return (lead._embedded?.tags ?? []).some((t) => t.name === tagName);
+}
+
 /** Связать уже созданную сделку склада с исходной сделкой диспетчера. */
 export async function linkLeads(skladLeadId: number, dispatchLeadId: number): Promise<void> {
   await amoFetch(`/api/v4/leads/${skladLeadId}/link`, {
     method: "POST",
     body: JSON.stringify([{ to_entity_id: dispatchLeadId, to_entity_type: "leads" }]),
   });
+}
+
+export interface AmoLink {
+  to_entity_id: number;
+  to_entity_type: string;
+}
+
+export async function getLeadLinks(leadId: number): Promise<AmoLink[]> {
+  const data = await amoFetch<{ _embedded?: { links: AmoLink[] } } | undefined>(
+    `/api/v4/leads/${leadId}/links`,
+  );
+  return data?._embedded?.links ?? [];
 }
 
 // ── Чтение значений кастомных полей ───────────────────────────────────

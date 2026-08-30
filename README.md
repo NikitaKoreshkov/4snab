@@ -47,9 +47,17 @@ src/lib/env.ts        — переменные окружения
 src/lib/auth.ts       — именные ссылки зав. склада
 src/lib/requests.ts   — доменный слой (сделка ⇄ заявка на отгрузку)
 src/app/api/amo-webhook/route.ts   — приём вебхука
+src/app/api/requests/                — JSON API (список + заявка), доступ по токену
 src/app/s/[token]/                 — интерфейс зав. склада
-scripts/discover.mjs  — вывод ID из amoCRM
+scripts/discover.mjs      — вывод ID воронок/этапов/полей из amoCRM
+scripts/create-fields.mjs — создание кастомных полей склада (идемпотентно)
 ```
+
+## Дедупликация
+
+После создания складской сделки сделка диспетчера помечается тегом
+`AMOCRM_PROCESSED_TAG`. Повторный вебхук по той же сделке ничего не создаёт.
+ID исходной сделки пишется в поле `AMOCRM_FIELD_SOURCE_LEAD` складской сделки.
 
 ## Что ещё не сделано
 
