@@ -41,11 +41,12 @@ function parseStatusChanges(form: FormData): StatusChange[] {
 }
 
 export async function POST(request: NextRequest) {
-  if (env.webhookSecret) {
-    const secret = request.nextUrl.searchParams.get("secret");
-    if (secret !== env.webhookSecret) {
-      return new Response("forbidden", { status: 403 });
-    }
+  if (!env.webhookSecret) {
+    return new Response("webhook secret not configured", { status: 503 });
+  }
+  const secret = request.nextUrl.searchParams.get("secret");
+  if (secret !== env.webhookSecret) {
+    return new Response("forbidden", { status: 403 });
   }
 
   const dispatchPipelineId = Number(env.pipelines.dispatchId);
@@ -66,6 +67,7 @@ export async function POST(request: NextRequest) {
   );
 
   const results: Record<string, string> = {};
+  let hasErrors = false;
   for (const change of changes) {
     try {
       if (await skladRequestExistsFor(change.id)) {
@@ -77,10 +79,14 @@ export async function POST(request: NextRequest) {
     } catch (err) {
       console.error("amo-webhook: не удалось создать заявку", change.id, err);
       results[change.id] = "error";
+      hasErrors = true;
     }
   }
 
-  return Response.json({ ok: true, processed: results });
+  return Response.json(
+    { ok: !hasErrors, processed: results },
+    { status: hasErrors ? 500 : 200 },
+  );
 }
 
 // amoCRM при сохранении вебхука дёргает GET для проверки доступности

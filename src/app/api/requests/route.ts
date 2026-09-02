@@ -19,7 +19,7 @@ export async function GET(request: NextRequest) {
   if (!user) return new Response("Unauthorized", { status: 401 });
 
   try {
-    const requests = await listRequests();
+    const requests = await listRequests(user.name);
     return Response.json({ user: user.name, requests });
   } catch (err) {
     console.error("GET /api/requests", err);

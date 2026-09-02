@@ -7,7 +7,13 @@ export interface AmoCustomFieldValue {
   field_name?: string;
   field_code?: string | null;
   field_type?: string;
-  values: { value: unknown; enum_id?: number; enum_code?: string }[];
+  values: { value: unknown; enum_id?: number; enum_code?: string | null }[];
+}
+
+export interface AmoFieldInputValue {
+  value: unknown;
+  enum_id?: number;
+  enum_code?: string | null;
 }
 
 export interface AmoLead {
@@ -51,6 +57,39 @@ class AmoError extends Error {
   }
 }
 
+function parseResponseBody(text: string): unknown {
+  if (!text) return undefined;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
+}
+
+function validationDetails(body: unknown): string | null {
+  if (!body || typeof body !== "object" || !("validation-errors" in body)) return null;
+  const groups = (body as { "validation-errors"?: unknown })["validation-errors"];
+  if (!Array.isArray(groups)) return null;
+  const details = groups.flatMap((group) => {
+    if (!group || typeof group !== "object") return [];
+    const errors = (group as { errors?: unknown }).errors;
+    if (!Array.isArray(errors)) return [];
+    return errors.flatMap((error) => {
+      if (!error || typeof error !== "object") return [];
+      const item = error as { path?: unknown; detail?: unknown; code?: unknown };
+      const path = typeof item.path === "string" ? item.path : "поле не указано";
+      const detail =
+        typeof item.detail === "string"
+          ? item.detail
+          : typeof item.code === "string"
+            ? item.code
+            : "ошибка валидации";
+      return [`${path}: ${detail}`];
+    });
+  });
+  return details.length ? details.join("; ") : null;
+}
+
 async function amoFetch<T>(
   path: string,
   init: RequestInit & { query?: Record<string, string | number | undefined> } = {},
@@ -76,10 +115,15 @@ async function amoFetch<T>(
   if (res.status === 204) return undefined as T;
 
   const text = await res.text();
-  const json = text ? JSON.parse(text) : undefined;
+  const json = parseResponseBody(text);
 
   if (!res.ok) {
-    throw new AmoError(`amoCRM ${res.status} на ${path}`, res.status, json);
+    const details = validationDetails(json);
+    throw new AmoError(
+      `amoCRM ${res.status} на ${path}${details ? ` — ${details}` : ""}`,
+      res.status,
+      json,
+    );
   }
   return json as T;
 }
@@ -148,7 +192,7 @@ export interface CreateLeadInput {
   name: string;
   pipeline_id: number;
   status_id: number;
-  custom_fields_values?: { field_id: number; values: { value: unknown }[] }[];
+  custom_fields_values?: { field_id: number; values: AmoFieldInputValue[] }[];
 }
 
 export async function createLead(input: CreateLeadInput): Promise<AmoLead> {
@@ -161,7 +205,7 @@ export async function createLead(input: CreateLeadInput): Promise<AmoLead> {
 
 export interface UpdateLeadInput {
   status_id?: number;
-  custom_fields_values?: { field_id: number; values: { value: unknown }[] }[];
+  custom_fields_values?: { field_id: number; values: AmoFieldInputValue[] }[];
   _embedded?: { tags: ({ id: number } | { name: string })[] };
 }
 
@@ -207,11 +251,240 @@ export async function getLeadLinks(leadId: number): Promise<AmoLink[]> {
   return data?._embedded?.links ?? [];
 }
 
+// ── Файлы ─────────────────────────────────────────────────────────────
+
+export interface AmoFile {
+  uuid: string;
+  version_uuid: string;
+  name: string;
+  sanitized_name?: string;
+  size: number;
+  type: string;
+  created_at: number;
+  metadata?: { extension?: string; mime_type?: string } | null;
+  previews?: Array<{
+    download_link: string;
+    width?: number;
+    height?: number;
+  }> | null;
+  _links?: {
+    download?: { href: string };
+    download_version?: { href: string };
+  };
+}
+
+export interface AmoFileUploadSession {
+  session_id: number;
+  upload_url: string;
+  max_file_size: number;
+  max_part_size: number;
+}
+
+export interface AmoFileUploadProgress {
+  session_id?: number;
+  next_url?: string;
+  uuid?: string;
+  version_uuid?: string;
+  name?: string;
+  size?: number;
+  type?: string;
+  created_at?: number;
+  metadata?: { extension?: string; mime_type?: string } | null;
+  previews?: AmoFile["previews"];
+  _links?: AmoFile["_links"];
+}
+
+interface AmoLeadFileLink {
+  id: number;
+  file_uuid: string;
+}
+
+let driveUrlPromise: Promise<string> | null = null;
+
+export async function getDriveUrl(): Promise<string> {
+  driveUrlPromise ??= amoFetch<{ drive_url?: string }>("/api/v4/account", {
+    query: { with: "drive_url" },
+  })
+    .then((account) => {
+      if (!account.drive_url) {
+        throw new Error("amoCRM не вернула адрес файлового сервиса");
+      }
+      return account.drive_url;
+    })
+    .catch((err) => {
+      driveUrlPromise = null;
+      throw err;
+    });
+  return driveUrlPromise;
+}
+
+async function driveFetch<T>(url: URL, init: RequestInit = {}): Promise<T> {
+  const res = await fetch(url, {
+    ...init,
+    headers: {
+      Authorization: `Bearer ${env.amocrm.accessToken}`,
+      ...init.headers,
+    },
+    cache: "no-store",
+  });
+
+  if (res.status === 204) return undefined as T;
+
+  const text = await res.text();
+  const body = parseResponseBody(text);
+  if (!res.ok) {
+    throw new AmoError(`amoCRM Files ${res.status} на ${url.pathname}`, res.status, body);
+  }
+  return body as T;
+}
+
+export async function createFileUploadSession(input: {
+  fileName: string;
+  fileSize: number;
+  contentType?: string;
+}): Promise<AmoFileUploadSession> {
+  const url = new URL("/v1.0/sessions", await getDriveUrl());
+  return driveFetch<AmoFileUploadSession>(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      file_name: input.fileName,
+      file_size: input.fileSize,
+      content_type: input.contentType || "application/octet-stream",
+      with_preview: true,
+    }),
+  });
+}
+
+/**
+ * Проксирует одну часть файла в amoCRM. URL сессионный, но всё равно строго
+ * проверяем домен и путь, чтобы пользовательский заголовок нельзя было превратить в SSRF.
+ */
+export async function uploadFilePart(
+  uploadUrl: string,
+  part: ArrayBuffer,
+): Promise<AmoFileUploadProgress> {
+  const url = new URL(uploadUrl);
+  const driveUrl = new URL(await getDriveUrl());
+  if (
+    url.protocol !== "https:" ||
+    url.host !== driveUrl.host ||
+    (!url.pathname.startsWith("/v1.0/sessions/upload/") &&
+      !url.pathname.startsWith("/upload/"))
+  ) {
+    throw new Error("Некорректный адрес сессии загрузки");
+  }
+
+  return driveFetch<AmoFileUploadProgress>(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/octet-stream" },
+    body: part,
+  });
+}
+
+/**
+ * Загружает содержимое файла сервером, не раскрывая access token amoCRM браузеру.
+ * URL принимается только с файлового домена текущего аккаунта.
+ */
+export async function downloadDriveFile(downloadUrl: string): Promise<Response> {
+  const url = new URL(downloadUrl);
+  const driveUrl = new URL(await getDriveUrl());
+  if (
+    url.protocol !== "https:" ||
+    url.host !== driveUrl.host ||
+    !url.pathname.startsWith("/download/")
+  ) {
+    throw new Error("Некорректный адрес файла amoCRM");
+  }
+
+  const response = await fetch(url, {
+    headers: { Authorization: `Bearer ${env.amocrm.accessToken}` },
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new AmoError(
+      `amoCRM Files ${response.status} при скачивании файла`,
+      response.status,
+      parseResponseBody(text),
+    );
+  }
+  return response;
+}
+
+export async function getLeadFileLinks(leadId: number): Promise<AmoLeadFileLink[]> {
+  const out: AmoLeadFileLink[] = [];
+  let beforeId: number | undefined;
+  const limit = 50;
+
+  for (;;) {
+    const data = await amoFetch<
+      { _embedded?: { files: AmoLeadFileLink[] } } | undefined
+    >(`/api/v4/leads/${leadId}/files`, {
+      query: { limit, before_id: beforeId },
+    });
+    const chunk = data?._embedded?.files ?? [];
+    out.push(...chunk);
+    if (chunk.length < limit) break;
+
+    const nextBeforeId = Math.min(...chunk.map((file) => file.id));
+    if (nextBeforeId === beforeId) break;
+    beforeId = nextBeforeId;
+  }
+
+  return out;
+}
+
+export async function getFilesByUuids(uuids: string[]): Promise<AmoFile[]> {
+  const unique = [...new Set(uuids)].filter(Boolean);
+  const out: AmoFile[] = [];
+  const driveUrl = await getDriveUrl();
+
+  for (let i = 0; i < unique.length; i += 50) {
+    const batch = unique.slice(i, i + 50);
+    const url = new URL("/v1.0/files", driveUrl);
+    url.searchParams.set("filter[uuid]", batch.join(","));
+    url.searchParams.set("limit", "50");
+    const data = await driveFetch<
+      { _embedded?: { files: AmoFile[] } } | undefined
+    >(url);
+    out.push(...(data?._embedded?.files ?? []));
+  }
+
+  return out;
+}
+
+export async function listLeadFiles(leadId: number): Promise<AmoFile[]> {
+  const links = await getLeadFileLinks(leadId);
+  const files = await getFilesByUuids(links.map((link) => link.file_uuid));
+  return files.sort((a, b) => b.created_at - a.created_at);
+}
+
+export async function linkFilesToLead(leadId: number, fileUuids: string[]): Promise<void> {
+  const unique = [...new Set(fileUuids)].filter(Boolean);
+  for (let i = 0; i < unique.length; i += 50) {
+    await amoFetch(`/api/v4/leads/${leadId}/files`, {
+      method: "PUT",
+      body: JSON.stringify(
+        unique.slice(i, i + 50).map((fileUuid) => ({ file_uuid: fileUuid })),
+      ),
+    });
+  }
+}
+
 // ── Чтение значений кастомных полей ───────────────────────────────────
 
 export function readFieldValue(lead: AmoLead, fieldId: number): unknown {
   const field = lead.custom_fields_values?.find((f) => f.field_id === fieldId);
   return field?.values?.[0]?.value;
+}
+
+export function readFieldValues(
+  lead: AmoLead,
+  fieldId: number,
+): AmoCustomFieldValue["values"] {
+  const field = lead.custom_fields_values?.find((f) => f.field_id === fieldId);
+  return field?.values ?? [];
 }
 
 export { AmoError };

@@ -3,7 +3,8 @@
 const money = new Intl.NumberFormat("ru-RU", {
   style: "currency",
   currency: "KZT",
-  maximumFractionDigits: 0,
+  minimumFractionDigits: 0,
+  maximumFractionDigits: 2,
 });
 
 export function formatMoney(value: number | null | undefined): string {

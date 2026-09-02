@@ -20,6 +20,14 @@
 # production
 /build
 
+# local warehouse database
+/data/*.sqlite
+/data/*.sqlite-shm
+/data/*.sqlite-wal
+/data/*.db
+/data/*.db-shm
+/data/*.db-wal
+
 # misc
 .DS_Store
 *.pem

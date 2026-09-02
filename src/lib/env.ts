@@ -39,6 +39,9 @@ export const env = {
     get dispatchShippingStatusId() {
       return opt("AMOCRM_DISPATCH_SHIPPING_STATUS_ID");
     },
+    get dispatchWaybillStatusId() {
+      return opt("AMOCRM_DISPATCH_WAYBILL_STATUS_ID");
+    },
     get skladId() {
       return opt("AMOCRM_SKLAD_PIPELINE_ID");
     },
@@ -58,8 +61,17 @@ export const env = {
     get company() {
       return opt("AMOCRM_FIELD_COMPANY");
     },
-    get quantity() {
-      return opt("AMOCRM_FIELD_QUANTITY");
+    get planQuantity() {
+      return opt("AMOCRM_FIELD_PLAN_QUANTITY") ?? opt("AMOCRM_FIELD_QUANTITY");
+    },
+    get actualQuantity() {
+      return opt("AMOCRM_FIELD_ACTUAL_QUANTITY");
+    },
+    get material() {
+      return opt("AMOCRM_FIELD_MATERIAL");
+    },
+    get description() {
+      return opt("AMOCRM_FIELD_DESCRIPTION");
     },
     get unitPrice() {
       return opt("AMOCRM_FIELD_UNIT_PRICE");
@@ -67,14 +79,11 @@ export const env = {
     get deliveryCost() {
       return opt("AMOCRM_FIELD_DELIVERY_COST");
     },
+    get palletCount() {
+      return opt("AMOCRM_FIELD_PALLET_COUNT");
+    },
     get budget() {
       return opt("AMOCRM_FIELD_BUDGET");
-    },
-    get waybill() {
-      return opt("AMOCRM_FIELD_WAYBILL");
-    },
-    get waybillPhoto() {
-      return opt("AMOCRM_FIELD_WAYBILL_PHOTO");
     },
     get sourceLead() {
       return opt("AMOCRM_FIELD_SOURCE_LEAD");
@@ -88,6 +97,9 @@ export const env = {
   },
   get warehouseUsersRaw() {
     return opt("WAREHOUSE_USERS");
+  },
+  get warehouseDbPath() {
+    return opt("WAREHOUSE_DB_PATH") ?? "data/warehouse.sqlite";
   },
   get appBaseUrl() {
     return opt("APP_BASE_URL") ?? "http://localhost:3000";

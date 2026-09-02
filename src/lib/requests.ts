@@ -1,119 +1,388 @@
-// Доменный слой: перевод между сделкой amoCRM и «заявкой на отгрузку».
+// Доменный слой: amoCRM хранит маршрут заявки, SQLite — подробности склада.
 import "server-only";
 import { env, requireId } from "./env";
 import {
   addLeadTag,
   createLead,
   getLead,
+  getLeadFileLinks,
+  getLeadLinks,
   leadHasTag,
+  linkFilesToLead,
   linkLeads,
+  listLeadFiles,
   listLeadsByPipeline,
-  readFieldValue,
+  readFieldValues,
   updateLead,
+  type AmoFieldInputValue,
+  type AmoFile,
   type AmoLead,
 } from "./amocrm";
+import {
+  sourceDate,
+  sourceMaterials,
+  sourceNumber,
+  sourceText,
+} from "./shipment-source";
+import { hasPositiveActualQuantity, minorToDecimal } from "./warehouse-calculations";
+import {
+  getWarehouseRepository,
+  legacyDraft,
+  type StoredWarehouseFile,
+} from "./warehouse-db";
+import {
+  WarehouseConflictError,
+  WarehouseLockedError,
+  WarehouseValidationError,
+  type SaveWarehouseRequestInput,
+  type SourceMaterial,
+  type WarehouseDraft,
+} from "./warehouse-types";
 
 export interface ShipmentRequest {
   id: number;
+  sourceLeadId: number | null;
   name: string;
-  /** Дата отгрузки, ISO yyyy-mm-dd или null */
   shipDate: string | null;
   company: string | null;
-  quantity: number | null;
-  unitPrice: number | null;
-  deliveryCost: number | null;
+  description: string | null;
+  planQuantity: number | null;
+  sourceActualQuantity: number | null;
+  materials: SourceMaterial[];
   budget: number | null;
   statusId: number;
   isDone: boolean;
   createdAt: string;
+  draft: WarehouseDraft;
+  syncIssue: string | null;
 }
 
-function num(value: unknown): number | null {
-  if (value === null || value === undefined || value === "") return null;
-  const n = Number(value);
-  return Number.isFinite(n) ? n : null;
+export interface RequestFile {
+  uuid: string;
+  name: string;
+  size: number;
+  type: string;
+  createdAt: string;
+  downloadUrl: string | null;
+  previewUrl: string | null;
 }
 
-function str(value: unknown): string | null {
-  if (value === null || value === undefined) return null;
-  const s = String(value).trim();
-  return s || null;
-}
-
-/**
- * amoCRM отдаёт даты кастомных полей как unix-таймстамп (сек) на 00:00 в таймзоне
- * аккаунта. Сдвигаем на 12 часов, чтобы не словить off-by-one при переводе в UTC-дату.
- */
-function dateStr(value: unknown): string | null {
-  if (value === null || value === undefined || value === "") return null;
-  const n = Number(value);
-  const d = Number.isFinite(n)
-    ? new Date(n * 1000 + 12 * 3600 * 1000)
-    : new Date(String(value));
-  if (Number.isNaN(d.getTime())) return null;
-  return d.toISOString().slice(0, 10);
-}
+type CustomFieldInput = { field_id: number; values: AmoFieldInputValue[] };
 
 function fieldId(value: string | undefined): number | null {
-  return value ? Number(value) : null;
+  if (!value) return null;
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
 }
 
-function read(lead: AmoLead, id: number | null): unknown {
-  return id ? readFieldValue(lead, id) : null;
+function requiredFieldId(value: string | undefined, name: string): number {
+  return Number(requireId(value, name));
 }
 
-export function calcBudget(
-  quantity: number | null,
-  unitPrice: number | null,
-  deliveryCost: number | null,
-): number | null {
-  if (quantity === null || unitPrice === null) return null;
-  return quantity * unitPrice + (deliveryCost ?? 0);
+function explicitSourceDispatchLeadId(lead: AmoLead): number | null {
+  const id = sourceNumber(lead, fieldId(env.fields.sourceLead));
+  return id && Number.isInteger(id) && id > 0 ? id : null;
 }
 
-function toShipmentRequest(lead: AmoLead): ShipmentRequest {
-  const quantity = num(read(lead, fieldId(env.fields.quantity)));
-  const unitPrice = num(read(lead, fieldId(env.fields.unitPrice)));
-  const deliveryCost = num(read(lead, fieldId(env.fields.deliveryCost)));
-  const storedBudget = num(read(lead, fieldId(env.fields.budget)));
-
-  return {
-    id: lead.id,
-    name: lead.name,
-    shipDate: dateStr(read(lead, fieldId(env.fields.shipDate))),
-    company: str(read(lead, fieldId(env.fields.company))),
-    quantity,
-    unitPrice,
-    deliveryCost,
-    budget: storedBudget ?? calcBudget(quantity, unitPrice, deliveryCost),
-    statusId: lead.status_id,
-    isDone: lead.status_id === Number(env.pipelines.skladDoneStatusId),
-    createdAt: new Date(lead.created_at * 1000).toISOString(),
-  };
-}
-
-// ── Чтение ────────────────────────────────────────────────────────────
-
-export async function listRequests(): Promise<ShipmentRequest[]> {
-  const pipelineId = Number(requireId(env.pipelines.skladId, "AMOCRM_SKLAD_PIPELINE_ID"));
-  const leads = await listLeadsByPipeline(pipelineId);
-  return leads
-    .map(toShipmentRequest)
-    .sort((a, b) => (a.shipDate ?? "9999").localeCompare(b.shipDate ?? "9999"));
-}
-
-export async function getRequest(id: number): Promise<ShipmentRequest> {
+async function getSkladLead(id: number): Promise<AmoLead> {
   const lead = await getLead(id);
   const pipelineId = Number(requireId(env.pipelines.skladId, "AMOCRM_SKLAD_PIPELINE_ID"));
   if (lead.pipeline_id !== pipelineId) {
     throw new Error("Заявка не принадлежит воронке «Склад»");
   }
-  return toShipmentRequest(lead);
+  return lead;
 }
 
-// ── Создание из сделки диспетчера (вызывается вебхуком) ───────────────
+async function requireDispatchLead(id: number): Promise<AmoLead> {
+  const lead = await getLead(id);
+  const pipelineId = Number(
+    requireId(env.pipelines.dispatchId, "AMOCRM_DISPATCH_PIPELINE_ID"),
+  );
+  if (lead.pipeline_id !== pipelineId) {
+    throw new Error("Исходная сделка не принадлежит воронке диспетчера");
+  }
+  return lead;
+}
 
-type Cfv = { field_id: number; values: { value: unknown }[] };
+async function resolveDispatchSource(
+  skladLead: AmoLead,
+): Promise<{ id: number; lead: AmoLead } | null> {
+  const explicitId = explicitSourceDispatchLeadId(skladLead);
+  if (explicitId) return { id: explicitId, lead: await requireDispatchLead(explicitId) };
+
+  // Старые заявки могли быть созданы до появления явного поля источника.
+  try {
+    const links = await getLeadLinks(skladLead.id);
+    for (const link of links) {
+      if (link.to_entity_type !== "leads") continue;
+      try {
+        const lead = await requireDispatchLead(link.to_entity_id);
+        return { id: lead.id, lead };
+      } catch {
+        // Связь может вести не на диспетчерскую сделку.
+      }
+    }
+  } catch {
+    // Некорректная старая заявка всё равно должна отображаться в списке.
+  }
+  return null;
+}
+
+function unlinkedDraft(materials: SourceMaterial[]): WarehouseDraft {
+  return {
+    exists: false,
+    legacy: false,
+    status: "draft",
+    version: 0,
+    palletCount: null,
+    deliveryCost: null,
+    deliveryCostMinor: null,
+    materialSubtotalMinor: 0,
+    totalMinor: 0,
+    items: materials.map((material, index) => ({
+      id: -(index + 1),
+      materialEnumId: material.enumId,
+      materialName: material.name,
+      sortOrder: material.sortOrder,
+      sourceActive: true,
+      unit: null,
+      actualQuantity: null,
+      unitPrice: null,
+      unitPriceMinor: null,
+      amountMinor: null,
+    })),
+    updatedBy: null,
+    updatedAt: null,
+    completedBy: null,
+    completedAt: null,
+  };
+}
+
+function toRequestFile(file: AmoFile): RequestFile {
+  return {
+    uuid: file.uuid,
+    name: file.name,
+    size: file.size,
+    type: file.metadata?.mime_type ?? file.type,
+    createdAt: new Date(file.created_at * 1000).toISOString(),
+    downloadUrl: file._links?.download?.href ?? null,
+    previewUrl: file.previews?.[0]?.download_link ?? null,
+  };
+}
+
+function storedRequestFile(file: StoredWarehouseFile): RequestFile {
+  return {
+    uuid: file.uuid,
+    name: file.name,
+    size: file.size,
+    type: file.mimeType,
+    createdAt: file.createdAt,
+    downloadUrl: file.downloadUrl,
+    previewUrl: file.previewUrl,
+  };
+}
+
+function cacheRequestFile(warehouseLeadId: number, file: RequestFile, versionUuid?: string) {
+  getWarehouseRepository().rememberRequestFile({
+    warehouseLeadId,
+    uuid: file.uuid,
+    versionUuid: versionUuid ?? null,
+    name: file.name,
+    size: file.size,
+    mimeType: file.type,
+    createdAt: file.createdAt,
+    downloadUrl: file.downloadUrl,
+    previewUrl: file.previewUrl,
+  });
+}
+
+async function syncFilesToLead(targetLeadId: number, fileUuids: string[]): Promise<void> {
+  if (!fileUuids.length) return;
+  const existing = new Set(
+    (await getLeadFileLinks(targetLeadId)).map((link) => link.file_uuid),
+  );
+  const missing = [...new Set(fileUuids)].filter((uuid) => !existing.has(uuid));
+  if (missing.length) await linkFilesToLead(targetLeadId, missing);
+}
+
+async function hydrateRequest(skladLead: AmoLead, actor: string): Promise<ShipmentRequest> {
+  const resolvedSource = await resolveDispatchSource(skladLead);
+  const sourceLeadId = resolvedSource?.id ?? null;
+  const sourceLead = resolvedSource?.lead ?? skladLead;
+  const materials = sourceMaterials(sourceLead, fieldId(env.fields.material));
+  const doneStatusId = Number(
+    requireId(env.pipelines.skladDoneStatusId, "AMOCRM_SKLAD_DONE_STATUS_ID"),
+  );
+  const amoIsDone = skladLead.status_id === doneStatusId;
+  const repository = getWarehouseRepository();
+  let draft: WarehouseDraft;
+  if (!sourceLeadId) {
+    draft = amoIsDone ? legacyDraft(materials) : unlinkedDraft(materials);
+  } else {
+    draft = repository.getDraft(skladLead.id);
+    if (amoIsDone) {
+      if (!draft.exists) {
+        draft = legacyDraft(materials);
+      } else if (draft.status !== "completed") {
+        draft = repository.markCompleted(skladLead.id, "system-recovery");
+      }
+    } else if (!draft.exists || draft.status === "draft") {
+      draft = repository.ensureDraft(skladLead.id, sourceLeadId, materials, actor);
+    }
+  }
+
+  const storedBudget = sourceNumber(skladLead, fieldId(env.fields.budget));
+  return {
+    id: skladLead.id,
+    sourceLeadId,
+    name: skladLead.name,
+    shipDate: sourceDate(sourceLead, fieldId(env.fields.shipDate)),
+    company: sourceText(sourceLead, fieldId(env.fields.company)),
+    description: sourceText(sourceLead, fieldId(env.fields.description)),
+    planQuantity: sourceNumber(sourceLead, fieldId(env.fields.planQuantity)),
+    sourceActualQuantity: sourceNumber(sourceLead, fieldId(env.fields.actualQuantity)),
+    materials,
+    budget:
+      draft.exists && draft.deliveryCostMinor !== null
+        ? Number(minorToDecimal(draft.totalMinor))
+        : storedBudget,
+    statusId: skladLead.status_id,
+    isDone: amoIsDone || draft.status === "completed",
+    createdAt: new Date(skladLead.created_at * 1000).toISOString(),
+    draft,
+    syncIssue:
+      !sourceLeadId && !amoIsDone
+        ? "У заявки нет связи с исходной сделкой диспетчера. Исправьте поле источника в amoCRM."
+        : null,
+  };
+}
+
+async function mapWithConcurrency<T, R>(
+  values: T[],
+  concurrency: number,
+  mapper: (value: T) => Promise<R>,
+): Promise<R[]> {
+  const output = new Array<R>(values.length);
+  let index = 0;
+  const workers = Array.from({ length: Math.min(concurrency, values.length) }, async () => {
+    while (index < values.length) {
+      const current = index;
+      index += 1;
+      output[current] = await mapper(values[current]);
+    }
+  });
+  await Promise.all(workers);
+  return output;
+}
+
+// ── Чтение ────────────────────────────────────────────────────────────
+
+export async function listRequests(actor = "warehouse-view"): Promise<ShipmentRequest[]> {
+  const pipelineId = Number(requireId(env.pipelines.skladId, "AMOCRM_SKLAD_PIPELINE_ID"));
+  const newStatusId = Number(
+    requireId(env.pipelines.skladNewStatusId, "AMOCRM_SKLAD_NEW_STATUS_ID"),
+  );
+  const doneStatusId = Number(
+    requireId(env.pipelines.skladDoneStatusId, "AMOCRM_SKLAD_DONE_STATUS_ID"),
+  );
+  const [newLeads, doneLeads] = await Promise.all([
+    listLeadsByPipeline(pipelineId, newStatusId),
+    listLeadsByPipeline(pipelineId, doneStatusId),
+  ]);
+  const hiddenLeadIds = getWarehouseRepository().hiddenLeadIds();
+  const leads = [
+    ...new Map([...newLeads, ...doneLeads].map((lead) => [lead.id, lead])).values(),
+  ].filter((lead) => !hiddenLeadIds.has(lead.id));
+  const requests = await mapWithConcurrency(leads, 3, (lead) =>
+    hydrateRequest(lead, actor),
+  );
+  return requests.sort((a, b) =>
+    (a.shipDate ?? "9999").localeCompare(b.shipDate ?? "9999"),
+  );
+}
+
+export async function getRequest(
+  id: number,
+  actor = "warehouse-view",
+): Promise<ShipmentRequest> {
+  if (getWarehouseRepository().hiddenLeadIds().has(id)) {
+    throw new Error("Складская заявка скрыта");
+  }
+  return hydrateRequest(await getSkladLead(id), actor);
+}
+
+export async function listRequestFiles(id: number): Promise<RequestFile[]> {
+  await getSkladLead(id);
+  const repository = getWarehouseRepository();
+  const cached = repository.requestFiles(id).map(storedRequestFile);
+  let remote: RequestFile[] = [];
+  try {
+    const amoFiles = await listLeadFiles(id);
+    remote = amoFiles.map(toRequestFile);
+    amoFiles.forEach((file, index) =>
+      cacheRequestFile(id, remote[index], file.version_uuid),
+    );
+  } catch (error) {
+    // Уже загруженные приложением файлы остаются доступны даже при временной
+    // ошибке или задержке индекса файлового API amoCRM.
+    if (!cached.length) throw error;
+    console.warn("listRequestFiles: используем локальный индекс", id, error);
+  }
+
+  const merged = new Map(cached.map((file) => [file.uuid, file]));
+  remote.forEach((file) => merged.set(file.uuid, file));
+  return [...merged.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+}
+
+export async function getRequestFile(id: number, uuid: string): Promise<RequestFile> {
+  const cached = getWarehouseRepository()
+    .requestFiles(id)
+    .find((candidate) => candidate.uuid === uuid);
+  if (cached) return storedRequestFile(cached);
+
+  const file = (await listRequestFiles(id)).find((candidate) => candidate.uuid === uuid);
+  if (!file) throw new Error("Накладная не привязана к этой заявке");
+  return file;
+}
+
+/** Привязывает файл к заявке и, после завершения, к сделке диспетчера. */
+export async function attachUploadedFileToRequest(
+  id: number,
+  file: AmoFile,
+): Promise<RequestFile> {
+  const lead = await getSkladLead(id);
+  await syncFilesToLead(id, [file.uuid]);
+  const draft = getWarehouseRepository().getDraft(id);
+  const doneStatusId = Number(
+    requireId(env.pipelines.skladDoneStatusId, "AMOCRM_SKLAD_DONE_STATUS_ID"),
+  );
+  if (lead.status_id === doneStatusId || draft.status === "completed") {
+    const source = await resolveDispatchSource(lead);
+    if (source) await syncFilesToLead(source.id, [file.uuid]);
+  }
+  const attached = toRequestFile(file);
+  cacheRequestFile(id, attached, file.version_uuid);
+  return attached;
+}
+
+// ── Создание из сделки диспетчера (вебхук) ────────────────────────────
+
+function carryField(source: AmoLead, id: number | null): CustomFieldInput | null {
+  if (!id) return null;
+  const values = readFieldValues(source, id);
+  if (!values.length) return null;
+  return {
+    field_id: id,
+    values: values.map((value) => {
+      const input: AmoFieldInputValue = { value: value.value };
+      if (typeof value.enum_id === "number") input.enum_id = value.enum_id;
+      if (typeof value.enum_code === "string" && value.enum_code) {
+        input.enum_code = value.enum_code;
+      }
+      return input;
+    }),
+  };
+}
 
 export async function createSkladRequestFromDispatch(
   dispatchLeadId: number,
@@ -124,95 +393,214 @@ export async function createSkladRequestFromDispatch(
   const newStatusId = Number(
     requireId(env.pipelines.skladNewStatusId, "AMOCRM_SKLAD_NEW_STATUS_ID"),
   );
+  const source = await requireDispatchLead(dispatchLeadId);
+  const carryOver = [
+    carryField(source, fieldId(env.fields.shipDate)),
+    carryField(source, fieldId(env.fields.company)),
+    carryField(source, fieldId(env.fields.planQuantity)),
+    carryField(source, fieldId(env.fields.material)),
+    carryField(source, fieldId(env.fields.description)),
+  ].filter((value): value is CustomFieldInput => value !== null);
 
-  const src = await getLead(dispatchLeadId);
-
-  // Переносим в складскую сделку то, что уже заполнено диспетчером.
-  const carryOver: Cfv[] = [];
-  for (const id of [
-    fieldId(env.fields.shipDate),
-    fieldId(env.fields.company),
-    fieldId(env.fields.quantity),
-  ]) {
-    if (!id) continue;
-    const value = readFieldValue(src, id);
-    if (value !== null && value !== undefined && value !== "") {
-      carryOver.push({ field_id: id, values: [{ value }] });
-    }
-  }
-
-  // ссылка на исходную сделку — для отчёта «Табель отгрузки» и защиты от дублей
-  const sourceFieldId = fieldId(env.fields.sourceLead);
-  if (sourceFieldId) {
-    carryOver.push({ field_id: sourceFieldId, values: [{ value: dispatchLeadId }] });
-  }
-
+  carryOver.push({
+    field_id: requiredFieldId(env.fields.sourceLead, "AMOCRM_FIELD_SOURCE_LEAD"),
+    values: [{ value: dispatchLeadId }],
+  });
   const created = await createLead({
-    name: src.name || `Отгрузка #${dispatchLeadId}`,
+    name: source.name || `Отгрузка #${dispatchLeadId}`,
     pipeline_id: skladPipelineId,
     status_id: newStatusId,
-    custom_fields_values: carryOver.length ? carryOver : undefined,
+    custom_fields_values: carryOver,
   });
 
-  // пометить сделку диспетчера как обработанную (для дедупликации вебхука)
   try {
     await addLeadTag(dispatchLeadId, env.processedTag);
   } catch {
-    // некритично
+    // Тег — дополнительная защита от дублей; явное поле источника остаётся главным.
   }
-  // нативная связь сделок (может быть недоступна в аккаунте — не критично)
   try {
     await linkLeads(created.id, dispatchLeadId);
   } catch {
-    /* noop */
+    // Нативная связь сделок доступна не во всех аккаунтах.
   }
 
-  return toShipmentRequest(await getLead(created.id));
+  const createdLead = await getLead(created.id);
+  try {
+    getWarehouseRepository().ensureDraft(
+      created.id,
+      dispatchLeadId,
+      sourceMaterials(source, fieldId(env.fields.material)),
+      "amo-webhook",
+    );
+  } catch (error) {
+    console.error("Не удалось заранее создать складской черновик", error);
+  }
+  return hydrateRequest(createdLead, "amo-webhook");
 }
 
-/**
- * Уже создавалась складская сделка для этой сделки диспетчера?
- * Проверяем по тегу на сделке диспетчера — это чтение по ID, без задержек индексации.
- */
 export async function skladRequestExistsFor(dispatchLeadId: number): Promise<boolean> {
-  return leadHasTag(dispatchLeadId, env.processedTag);
+  if (await leadHasTag(dispatchLeadId, env.processedTag)) return true;
+  const pipelineId = Number(requireId(env.pipelines.skladId, "AMOCRM_SKLAD_PIPELINE_ID"));
+  const sourceFieldId = requiredFieldId(env.fields.sourceLead, "AMOCRM_FIELD_SOURCE_LEAD");
+  const leads = await listLeadsByPipeline(pipelineId);
+  return leads.some(
+    (lead) => sourceNumber(lead, sourceFieldId) === dispatchLeadId,
+  );
 }
 
-// ── Сохранение зав.складом ───────────────────────────────────────────
+// ── Сохранение и завершение ──────────────────────────────────────────
 
-export interface SaveRequestInput {
-  quantity: number | null;
-  unitPrice: number;
-  deliveryCost: number;
-  markDone: boolean;
-}
-
-export async function saveRequest(
-  id: number,
-  input: SaveRequestInput,
-): Promise<ShipmentRequest> {
-  const current = await getRequest(id);
-  const quantity = input.quantity ?? current.quantity;
-  const budget = calcBudget(quantity, input.unitPrice, input.deliveryCost);
-
-  const cfv: Cfv[] = [];
-  const push = (fid: number | null, value: unknown) => {
-    if (fid && value !== null && value !== undefined) {
-      cfv.push({ field_id: fid, values: [{ value }] });
+function assertCompletion(request: ShipmentRequest, input: SaveWarehouseRequestInput): void {
+  if (!request.company) throw new WarehouseValidationError("В amoCRM не указан объект");
+  if (!request.shipDate) throw new WarehouseValidationError("В amoCRM не указана дата отгрузки");
+  if (request.planQuantity === null) {
+    throw new WarehouseValidationError("В amoCRM не указано плановое количество");
+  }
+  if (!request.materials.length) {
+    throw new WarehouseValidationError("В amoCRM не выбран ни один материал");
+  }
+  if (input.palletCount === null || !Number.isInteger(input.palletCount) || input.palletCount < 0) {
+    throw new WarehouseValidationError(
+      "Количество поддонов должно быть целым неотрицательным числом",
+    );
+  }
+  if (input.deliveryCost === null || String(input.deliveryCost).trim() === "") {
+    throw new WarehouseValidationError("Укажите стоимость доставки, даже если она равна 0");
+  }
+  for (const source of request.draft.items.filter((item) => item.sourceActive)) {
+    const item = input.items.find((candidate) => candidate.materialEnumId === source.materialEnumId);
+    if (!item) throw new WarehouseConflictError();
+    if (item.actualQuantity === null || String(item.actualQuantity).trim() === "") {
+      throw new WarehouseValidationError(`Укажите фактическое количество: ${source.materialName}`);
     }
-  };
-  push(fieldId(env.fields.quantity), input.quantity);
-  push(fieldId(env.fields.unitPrice), input.unitPrice);
-  push(fieldId(env.fields.deliveryCost), input.deliveryCost);
-  push(fieldId(env.fields.budget), budget);
+    if (!item.unit?.trim()) {
+      throw new WarehouseValidationError(`Укажите единицу измерения: ${source.materialName}`);
+    }
+    if (item.unit.trim().length > 30) {
+      throw new WarehouseValidationError(`Единица измерения слишком длинная: ${source.materialName}`);
+    }
+    if (item.unitPrice === null || String(item.unitPrice).trim() === "") {
+      throw new WarehouseValidationError(`Укажите закупочную цену: ${source.materialName}`);
+    }
+  }
+  if (!hasPositiveActualQuantity(input.items)) {
+    throw new WarehouseValidationError(
+      "Хотя бы у одной позиции фактическое количество должно быть больше 0",
+    );
+  }
+}
 
-  await updateLead(id, {
-    custom_fields_values: cfv.length ? cfv : undefined,
-    status_id:
-      input.markDone && env.pipelines.skladDoneStatusId
-        ? Number(env.pipelines.skladDoneStatusId)
-        : undefined,
+function pushField(
+  fields: CustomFieldInput[],
+  id: number,
+  value: unknown,
+): void {
+  fields.push({ field_id: id, values: [{ value }] });
+}
+
+async function synchronizeCompletion(
+  skladLead: AmoLead,
+  request: ShipmentRequest,
+  draft: WarehouseDraft,
+): Promise<void> {
+  const dispatchLeadId = request.sourceLeadId;
+  if (!dispatchLeadId) {
+    throw new WarehouseValidationError(
+      "У заявки нет связи с исходной сделкой диспетчера",
+    );
+  }
+  await requireDispatchLead(dispatchLeadId);
+  const fields: CustomFieldInput[] = [];
+  pushField(
+    fields,
+    requiredFieldId(env.fields.deliveryCost, "AMOCRM_FIELD_DELIVERY_COST"),
+    Number(minorToDecimal(draft.deliveryCostMinor)),
+  );
+  pushField(
+    fields,
+    requiredFieldId(env.fields.palletCount, "AMOCRM_FIELD_PALLET_COUNT"),
+    draft.palletCount,
+  );
+  pushField(
+    fields,
+    requiredFieldId(env.fields.budget, "AMOCRM_FIELD_BUDGET"),
+    Number(minorToDecimal(draft.totalMinor)),
+  );
+
+  const activeItems = draft.items.filter((item) => item.sourceActive);
+  if (activeItems.length === 1) {
+    const item = activeItems[0];
+    pushField(
+      fields,
+      requiredFieldId(env.fields.actualQuantity, "AMOCRM_FIELD_ACTUAL_QUANTITY"),
+      Number(item.actualQuantity),
+    );
+    pushField(
+      fields,
+      requiredFieldId(env.fields.unitPrice, "AMOCRM_FIELD_UNIT_PRICE"),
+      Number(minorToDecimal(item.unitPriceMinor)),
+    );
+  }
+
+  // Повтор каждого шага безопасен: PATCH заменяет значения, файлы дедуплицируются.
+  await updateLead(dispatchLeadId, { custom_fields_values: fields });
+  const fileUuids = (await getLeadFileLinks(request.id)).map((file) => file.file_uuid);
+  await syncFilesToLead(dispatchLeadId, fileUuids);
+  await updateLead(dispatchLeadId, {
+    status_id: Number(
+      requireId(
+        env.pipelines.dispatchWaybillStatusId,
+        "AMOCRM_DISPATCH_WAYBILL_STATUS_ID",
+      ),
+    ),
   });
+  await updateLead(request.id, {
+    custom_fields_values: fields,
+    status_id: Number(
+      requireId(env.pipelines.skladDoneStatusId, "AMOCRM_SKLAD_DONE_STATUS_ID"),
+    ),
+  });
+}
 
-  return getRequest(id);
+export async function saveWarehouseRequest(
+  id: number,
+  input: SaveWarehouseRequestInput,
+  actor: string,
+): Promise<ShipmentRequest> {
+  const skladLead = await getSkladLead(id);
+  const request = await hydrateRequest(skladLead, actor);
+  if (request.syncIssue) throw new WarehouseValidationError(request.syncIssue);
+  if (request.isDone || request.draft.legacy || request.draft.status === "completed") {
+    throw new WarehouseLockedError();
+  }
+
+  const repository = getWarehouseRepository();
+  if (request.draft.status === "completing") {
+    if (input.action !== "complete") throw new WarehouseLockedError();
+    if (input.version !== request.draft.version) throw new WarehouseConflictError();
+    await synchronizeCompletion(skladLead, request, request.draft);
+    repository.markCompleted(id, actor);
+    return getRequest(id, actor);
+  }
+
+  if (input.action === "complete") {
+    assertCompletion(request, input);
+    const files = await getLeadFileLinks(id);
+    if (!files.length) {
+      throw new WarehouseValidationError("Перед завершением добавьте хотя бы одну накладную");
+    }
+  }
+
+  const draft = repository.saveDraft(
+    id,
+    input.version,
+    input,
+    actor,
+    input.action === "complete" ? "completing" : "draft",
+  );
+  if (input.action === "draft") return getRequest(id, actor);
+
+  await synchronizeCompletion(skladLead, request, draft);
+  repository.markCompleted(id, actor);
+  return getRequest(id, actor);
 }

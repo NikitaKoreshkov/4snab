@@ -34,8 +34,6 @@ const WANT = [
   { key: "AMOCRM_FIELD_UNIT_PRICE", name: "Цена за единицу (склад)", type: "numeric" },
   { key: "AMOCRM_FIELD_DELIVERY_COST", name: "Стоимость доставки (склад)", type: "numeric" },
   { key: "AMOCRM_FIELD_BUDGET", name: "Бюджет отгрузки (склад)", type: "numeric" },
-  { key: "AMOCRM_FIELD_WAYBILL", name: "Накладная (склад)", type: "file" },
-  { key: "AMOCRM_FIELD_WAYBILL_PHOTO", name: "Фото подписанной накладной (склад)", type: "file" },
   { key: "AMOCRM_FIELD_SOURCE_LEAD", name: "Исходная сделка диспетчера (ID)", type: "numeric" },
 ];
 

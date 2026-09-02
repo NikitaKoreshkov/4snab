@@ -1,51 +1,72 @@
-// JSON API для одной заявки склада. Доступ по токену зав.склада.
-//   GET   /api/requests/<id>?token=<token>
-//   PATCH /api/requests/<id>?token=<token>   body: { quantity?, unitPrice, deliveryCost, markDone? }
+// JSON API одной складской заявки.
 import type { NextRequest } from "next/server";
 import { z } from "zod";
 import { getUserByToken } from "@/lib/auth";
-import { getRequest, saveRequest } from "@/lib/requests";
+import { getRequest, saveWarehouseRequest } from "@/lib/requests";
+import {
+  WarehouseConflictError,
+  WarehouseLockedError,
+  WarehouseValidationError,
+} from "@/lib/warehouse-types";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 function tokenFrom(request: NextRequest): string | null {
-  return (
-    request.nextUrl.searchParams.get("token") ||
-    request.headers.get("x-warehouse-token")
-  );
+  return request.nextUrl.searchParams.get("token") || request.headers.get("x-warehouse-token");
 }
 
+const decimalSchema = z
+  .union([z.string(), z.number()])
+  .transform((value) => String(value))
+  .refine((value) => /^\d+(?:[.,]\d+)?$/.test(value), "Укажите неотрицательное число")
+  .nullable();
+
 const patchSchema = z.object({
-  quantity: z.number().min(0).nullable().optional(),
-  unitPrice: z.number().min(0),
-  deliveryCost: z.number().min(0),
-  markDone: z.boolean().optional(),
+  action: z.enum(["draft", "complete"]),
+  version: z.number().int().nonnegative(),
+  palletCount: z.number().int().min(0).nullable(),
+  deliveryCost: decimalSchema,
+  items: z.array(
+    z.object({
+      materialEnumId: z.number().int(),
+      actualQuantity: decimalSchema,
+      unit: z.string().nullable(),
+      unitPrice: decimalSchema,
+    }),
+  ),
 });
 
 export async function GET(
   request: NextRequest,
-  ctx: RouteContext<"/api/requests/[id]">,
+  context: RouteContext<"/api/requests/[id]">,
 ) {
-  if (!getUserByToken(tokenFrom(request) ?? "")) {
-    return new Response("Unauthorized", { status: 401 });
+  const user = getUserByToken(tokenFrom(request) ?? "");
+  if (!user) return Response.json({ error: "Unauthorized" }, { status: 401 });
+  const { id } = await context.params;
+  const requestId = Number(id);
+  if (!Number.isInteger(requestId) || requestId <= 0) {
+    return Response.json({ error: "Not found" }, { status: 404 });
   }
-  const { id } = await ctx.params;
   try {
-    return Response.json(await getRequest(Number(id)));
-  } catch {
-    return new Response("Not found", { status: 404 });
+    return Response.json(await getRequest(requestId, user.name));
+  } catch (error) {
+    console.error("GET /api/requests/[id]", error);
+    return Response.json({ error: "Not found" }, { status: 404 });
   }
 }
 
 export async function PATCH(
   request: NextRequest,
-  ctx: RouteContext<"/api/requests/[id]">,
+  context: RouteContext<"/api/requests/[id]">,
 ) {
-  if (!getUserByToken(tokenFrom(request) ?? "")) {
-    return new Response("Unauthorized", { status: 401 });
+  const user = getUserByToken(tokenFrom(request) ?? "");
+  if (!user) return Response.json({ error: "Unauthorized" }, { status: 401 });
+  const { id } = await context.params;
+  const requestId = Number(id);
+  if (!Number.isInteger(requestId) || requestId <= 0) {
+    return Response.json({ error: "Not found" }, { status: 404 });
   }
-  const { id } = await ctx.params;
 
   const parsed = patchSchema.safeParse(await request.json().catch(() => null));
   if (!parsed.success) {
@@ -53,15 +74,23 @@ export async function PATCH(
   }
 
   try {
-    const updated = await saveRequest(Number(id), {
-      quantity: parsed.data.quantity ?? null,
-      unitPrice: parsed.data.unitPrice,
-      deliveryCost: parsed.data.deliveryCost,
-      markDone: parsed.data.markDone ?? false,
-    });
-    return Response.json(updated);
-  } catch (err) {
-    console.error("PATCH /api/requests/[id]", err);
-    return new Response("amoCRM error", { status: 502 });
+    return Response.json(
+      await saveWarehouseRequest(requestId, parsed.data, user.name),
+    );
+  } catch (error) {
+    console.error("PATCH /api/requests/[id]", error);
+    if (error instanceof WarehouseConflictError) {
+      return Response.json({ error: error.message }, { status: 409 });
+    }
+    if (error instanceof WarehouseLockedError) {
+      return Response.json({ error: error.message }, { status: 423 });
+    }
+    if (error instanceof WarehouseValidationError) {
+      return Response.json({ error: error.message }, { status: 400 });
+    }
+    return Response.json(
+      { error: "Не удалось синхронизировать заявку с amoCRM" },
+      { status: 502 },
+    );
   }
 }
