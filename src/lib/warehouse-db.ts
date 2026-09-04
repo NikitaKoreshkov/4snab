@@ -281,11 +281,30 @@ export class WarehouseRepository {
       );
   }
 
+  forgetRequestFile(warehouseLeadId: number, uuid: string): void {
+    this.db
+      .prepare(
+        `DELETE FROM warehouse_request_files
+         WHERE warehouse_lead_id = ? AND file_uuid = ?`,
+      )
+      .run(warehouseLeadId, uuid);
+  }
+
   hiddenLeadIds(): Set<number> {
     const rows = this.db
       .prepare("SELECT warehouse_lead_id FROM warehouse_hidden_requests")
       .all() as Array<{ warehouse_lead_id: number }>;
     return new Set(rows.map((row) => row.warehouse_lead_id));
+  }
+
+  hasDispatchLead(dispatchLeadId: number): boolean {
+    if (!Number.isInteger(dispatchLeadId) || dispatchLeadId <= 0) return false;
+    const row = this.db
+      .prepare(
+        "SELECT 1 AS ok FROM warehouse_requests WHERE dispatch_lead_id = ? LIMIT 1",
+      )
+      .get(dispatchLeadId) as { ok: number } | undefined;
+    return Boolean(row);
   }
 
   hideRequests(warehouseLeadIds: number[], actor: string): number {

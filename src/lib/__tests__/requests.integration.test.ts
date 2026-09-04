@@ -12,18 +12,24 @@ const mocks = vi.hoisted(() => {
     updateLead: vi.fn(),
     getLeadFileLinks: vi.fn(),
     getLeadLinks: vi.fn(),
+    getLeadsByIds: vi.fn(),
+    findLeadsByCustomField: vi.fn(),
     linkFilesToLead: vi.fn(),
     addLeadTag: vi.fn(),
     leadHasTag: vi.fn(),
     linkLeads: vi.fn(),
     listLeadFiles: vi.fn(),
     listLeadsByPipeline: vi.fn(),
+    unlinkFilesFromLead: vi.fn(),
     repository: {
       hiddenLeadIds: vi.fn(),
       getDraft: vi.fn(),
       ensureDraft: vi.fn(),
       saveDraft: vi.fn(),
       markCompleted: vi.fn(),
+      requestFiles: vi.fn(),
+      forgetRequestFile: vi.fn(),
+      hasDispatchLead: vi.fn(),
     },
   };
 });
@@ -34,12 +40,15 @@ vi.mock("../amocrm", () => ({
   updateLead: mocks.updateLead,
   getLeadFileLinks: mocks.getLeadFileLinks,
   getLeadLinks: mocks.getLeadLinks,
+  getLeadsByIds: mocks.getLeadsByIds,
+  findLeadsByCustomField: mocks.findLeadsByCustomField,
   linkFilesToLead: mocks.linkFilesToLead,
   addLeadTag: mocks.addLeadTag,
   leadHasTag: mocks.leadHasTag,
   linkLeads: mocks.linkLeads,
   listLeadFiles: mocks.listLeadFiles,
   listLeadsByPipeline: mocks.listLeadsByPipeline,
+  unlinkFilesFromLead: mocks.unlinkFilesFromLead,
   readFieldValue: (lead: AmoLead, id: number) =>
     lead.custom_fields_values?.find((field) => field.field_id === id)?.values[0]?.value,
   readFieldValues: (lead: AmoLead, id: number) =>
@@ -68,8 +77,11 @@ vi.mock("../warehouse-db", () => ({
 
 import {
   createSkladRequestFromDispatch,
+  detachRequestFile,
   getRequest,
+  listRequests,
   saveWarehouseRequest,
+  skladRequestExistsFor,
 } from "../requests";
 
 const DISPATCH_ID = 500;
@@ -196,6 +208,13 @@ describe("requests amoCRM integration", () => {
       id === WAREHOUSE_ID ? [{ id: 1, file_uuid: "invoice-1" }] : [],
     );
     mocks.getLeadLinks.mockResolvedValue([]);
+    mocks.getLeadsByIds.mockResolvedValue([]);
+    mocks.findLeadsByCustomField.mockResolvedValue([]);
+    mocks.leadHasTag.mockResolvedValue(false);
+    mocks.unlinkFilesFromLead.mockResolvedValue(undefined);
+    mocks.repository.requestFiles.mockReturnValue([]);
+    mocks.repository.forgetRequestFile.mockReturnValue(undefined);
+    mocks.repository.hasDispatchLead.mockReturnValue(false);
     mocks.repository.getDraft.mockImplementation(() => mocks.state.draft);
     mocks.repository.ensureDraft.mockImplementation(() => mocks.state.draft);
     mocks.repository.saveDraft.mockImplementation((_id, _version, input) => {
@@ -350,6 +369,61 @@ describe("requests amoCRM integration", () => {
     bad.items[0].actualQuantity = "0";
     await expect(saveWarehouseRequest(WAREHOUSE_ID, bad, "Склад")).rejects.toBeInstanceOf(
       WarehouseValidationError,
+    );
+  });
+
+  it("loads the open list from warehouse leads without extra amoCRM roundtrips", async () => {
+    mocks.getLead.mockClear();
+    mocks.repository.ensureDraft.mockClear();
+    warehouse = {
+      ...warehouse,
+      custom_fields_values: [
+        { field_id: 2, values: [{ value: "Объект" }] },
+        { field_id: 5, values: [{ value: "ПГС", enum_id: 101 }] },
+        { field_id: 11, values: [{ value: DISPATCH_ID }] },
+      ],
+    };
+    mocks.listLeadsByPipeline.mockResolvedValue([warehouse]);
+    const requests = await listRequests("Склад");
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({
+      id: WAREHOUSE_ID,
+      sourceLeadId: DISPATCH_ID,
+      company: "Объект",
+    });
+    expect(mocks.listLeadsByPipeline).toHaveBeenCalledWith(200, 201);
+    expect(mocks.getLeadsByIds).toHaveBeenCalledWith([]);
+    expect(mocks.getLead).not.toHaveBeenCalled();
+    expect(mocks.repository.ensureDraft).not.toHaveBeenCalled();
+  });
+
+  it("detects an existing warehouse request without scanning the pipeline", async () => {
+    mocks.repository.hasDispatchLead.mockReturnValue(true);
+    await expect(skladRequestExistsFor(DISPATCH_ID)).resolves.toBe(true);
+    expect(mocks.leadHasTag).not.toHaveBeenCalled();
+    expect(mocks.findLeadsByCustomField).not.toHaveBeenCalled();
+    expect(mocks.listLeadsByPipeline).not.toHaveBeenCalled();
+  });
+
+  it("falls back to a source-field lookup instead of listing every warehouse lead", async () => {
+    mocks.findLeadsByCustomField.mockResolvedValue([warehouse]);
+    await expect(skladRequestExistsFor(DISPATCH_ID)).resolves.toBe(true);
+    expect(mocks.findLeadsByCustomField).toHaveBeenCalledWith({
+      pipelineId: 200,
+      fieldId: 11,
+      value: DISPATCH_ID,
+      limit: 1,
+    });
+    expect(mocks.listLeadsByPipeline).not.toHaveBeenCalled();
+  });
+
+  it("unlinks a waybill from the warehouse lead via Files API", async () => {
+    mocks.repository.requestFiles.mockReturnValue([{ uuid: "invoice-1" }]);
+    await detachRequestFile(WAREHOUSE_ID, "invoice-1");
+    expect(mocks.unlinkFilesFromLead).toHaveBeenCalledWith(WAREHOUSE_ID, ["invoice-1"]);
+    expect(mocks.repository.forgetRequestFile).toHaveBeenCalledWith(
+      WAREHOUSE_ID,
+      "invoice-1",
     );
   });
 });

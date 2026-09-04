@@ -90,10 +90,10 @@ function validationDetails(body: unknown): string | null {
   return details.length ? details.join("; ") : null;
 }
 
-async function amoFetch<T>(
+async function amoRequest(
   path: string,
   init: RequestInit & { query?: Record<string, string | number | undefined> } = {},
-): Promise<T> {
+): Promise<{ json: unknown; headers: Headers }> {
   const { query, ...rest } = init;
   const url = new URL(path, env.amocrm.baseUrl);
   if (query) {
@@ -112,7 +112,7 @@ async function amoFetch<T>(
     cache: "no-store",
   });
 
-  if (res.status === 204) return undefined as T;
+  if (res.status === 204) return { json: undefined, headers: res.headers };
 
   const text = await res.text();
   const json = parseResponseBody(text);
@@ -125,7 +125,14 @@ async function amoFetch<T>(
       json,
     );
   }
-  return json as T;
+  return { json, headers: res.headers };
+}
+
+async function amoFetch<T>(
+  path: string,
+  init: RequestInit & { query?: Record<string, string | number | undefined> } = {},
+): Promise<T> {
+  return (await amoRequest(path, init)).json as T;
 }
 
 // ── Справочники ────────────────────────────────────────────────────────
@@ -154,31 +161,84 @@ export async function getLeadCustomFields(): Promise<AmoCustomField[]> {
 
 // ── Сделки ────────────────────────────────────────────────────────────
 
-export async function getLead(id: number): Promise<AmoLead> {
-  return amoFetch<AmoLead>(`/api/v4/leads/${id}`, {
-    query: { with: "companies,contacts" },
+const LEAD_CACHE_MS = 15_000;
+const leadCache = new Map<string, { expiresAt: number; value: Promise<AmoLead> }>();
+
+function leadCacheKey(id: number, withParam?: string): string {
+  return withParam ? `${id}?with=${withParam}` : String(id);
+}
+
+export function invalidateLeadCache(id?: number): void {
+  if (id === undefined) {
+    leadCache.clear();
+    return;
+  }
+  const prefix = `${id}?`;
+  for (const key of leadCache.keys()) {
+    if (key === String(id) || key.startsWith(prefix)) leadCache.delete(key);
+  }
+}
+
+export async function getLead(
+  id: number,
+  options?: { with?: string },
+): Promise<AmoLead> {
+  const now = Date.now();
+  const key = leadCacheKey(id, options?.with);
+  const cached = leadCache.get(key);
+  if (cached && cached.expiresAt > now) return cached.value;
+
+  const value = amoFetch<AmoLead>(`/api/v4/leads/${id}`, {
+    query: options?.with ? { with: options.with } : undefined,
+  }).catch((error) => {
+    const current = leadCache.get(key);
+    if (current?.value === value) leadCache.delete(key);
+    throw error;
   });
+  leadCache.set(key, { expiresAt: now + LEAD_CACHE_MS, value });
+  return value;
+}
+
+export async function getLeadsByIds(ids: number[]): Promise<AmoLead[]> {
+  const unique = [...new Set(ids)].filter((id) => Number.isInteger(id) && id > 0);
+  if (!unique.length) return [];
+
+  const out: AmoLead[] = [];
+  for (let i = 0; i < unique.length; i += 50) {
+    const batch = unique.slice(i, i + 50);
+    const query: Record<string, string | number | undefined> = { limit: 250 };
+    batch.forEach((id, index) => {
+      query[`filter[id][${index}]`] = id;
+    });
+    const data = await amoFetch<{ _embedded?: { leads: AmoLead[] } } | undefined>(
+      "/api/v4/leads",
+      { query },
+    );
+    out.push(...(data?._embedded?.leads ?? []));
+  }
+  return out;
 }
 
 export async function listLeadsByPipeline(
   pipelineId: number,
-  statusId?: number,
+  statusId?: number | number[],
 ): Promise<AmoLead[]> {
+  const statusIds = statusId === undefined ? [] : [statusId].flat();
   const out: AmoLead[] = [];
   let page = 1;
   for (;;) {
+    const query: Record<string, string | number | undefined> = {
+      "filter[pipeline_id]": pipelineId,
+      page,
+      limit: 250,
+    };
+    statusIds.forEach((id, index) => {
+      query[`filter[statuses][${index}][pipeline_id]`] = pipelineId;
+      query[`filter[statuses][${index}][status_id]`] = id;
+    });
     const data = await amoFetch<{ _embedded?: { leads: AmoLead[] } } | undefined>(
       "/api/v4/leads",
-      {
-        query: {
-          "filter[pipeline_id]": pipelineId,
-          "filter[statuses][0][pipeline_id]": statusId ? pipelineId : undefined,
-          "filter[statuses][0][status_id]": statusId,
-          with: "companies,contacts",
-          page,
-          limit: 250,
-        },
-      },
+      { query },
     );
     const chunk = data?._embedded?.leads ?? [];
     out.push(...chunk);
@@ -186,6 +246,35 @@ export async function listLeadsByPipeline(
     page += 1;
   }
   return out;
+}
+
+export async function countLeadsByPipeline(
+  pipelineId: number,
+  statusId: number,
+): Promise<number> {
+  // amoCRM на этом аккаунте не отдаёт X-Total-Count; считаем по фактической выборке этапа.
+  return (await listLeadsByPipeline(pipelineId, statusId)).length;
+}
+
+export async function findLeadsByCustomField(options: {
+  pipelineId: number;
+  fieldId: number;
+  value: number | string;
+  limit?: number;
+}): Promise<AmoLead[]> {
+  // filter[custom_fields_values] на аккаунте даёт 400 "Invalid filter for current account".
+  // Поиск по query + воронка работает; точное поле проверяет вызывающий код.
+  const data = await amoFetch<{ _embedded?: { leads: AmoLead[] } } | undefined>(
+    "/api/v4/leads",
+    {
+      query: {
+        query: String(options.value),
+        "filter[pipeline_id]": options.pipelineId,
+        limit: options.limit ?? 10,
+      },
+    },
+  );
+  return data?._embedded?.leads ?? [];
 }
 
 export interface CreateLeadInput {
@@ -206,6 +295,7 @@ export async function createLead(input: CreateLeadInput): Promise<AmoLead> {
 export interface UpdateLeadInput {
   status_id?: number;
   custom_fields_values?: { field_id: number; values: AmoFieldInputValue[] }[];
+  tags_to_add?: ({ id: number } | { name: string })[];
   _embedded?: { tags: ({ id: number } | { name: string })[] };
 }
 
@@ -214,20 +304,16 @@ export async function updateLead(id: number, input: UpdateLeadInput): Promise<vo
     method: "PATCH",
     body: JSON.stringify(input),
   });
+  invalidateLeadCache(id);
 }
 
 /** Добавляет тег сделке, не затирая существующие. */
 export async function addLeadTag(id: number, tagName: string): Promise<void> {
-  const lead = await getLead(id);
-  const current = lead._embedded?.tags ?? [];
-  if (current.some((t) => t.name === tagName)) return;
-  await updateLead(id, {
-    _embedded: { tags: [...current.map((t) => ({ id: t.id })), { name: tagName }] },
-  });
+  await updateLead(id, { tags_to_add: [{ name: tagName }] });
 }
 
 export async function leadHasTag(id: number, tagName: string): Promise<boolean> {
-  const lead = await getLead(id);
+  const lead = await getLead(id, { with: "tags" });
   return (lead._embedded?.tags ?? []).some((t) => t.name === tagName);
 }
 
@@ -469,6 +555,28 @@ export async function linkFilesToLead(leadId: number, fileUuids: string[]): Prom
         unique.slice(i, i + 50).map((fileUuid) => ({ file_uuid: fileUuid })),
       ),
     });
+  }
+}
+
+/** Отвязывает файлы от сделки. Scope «Удаление файлов» не нужен. */
+export async function unlinkFilesFromLead(
+  leadId: number,
+  fileUuids: string[],
+): Promise<void> {
+  const unique = [...new Set(fileUuids)].filter(Boolean);
+  if (!unique.length) return;
+  for (let i = 0; i < unique.length; i += 50) {
+    try {
+      await amoFetch(`/api/v4/leads/${leadId}/files`, {
+        method: "DELETE",
+        body: JSON.stringify(
+          unique.slice(i, i + 50).map((fileUuid) => ({ file_uuid: fileUuid })),
+        ),
+      });
+    } catch (error) {
+      if (error instanceof AmoError && error.status === 404) continue;
+      throw error;
+    }
   }
 }
 

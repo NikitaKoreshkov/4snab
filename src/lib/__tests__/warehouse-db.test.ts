@@ -79,6 +79,13 @@ describe("WarehouseRepository", () => {
     expect(repository.hiddenLeadIds()).toEqual(new Set([100, 101]));
   });
 
+  it("finds a draft by the dispatcher lead id", () => {
+    expect(repository.hasDispatchLead(200)).toBe(false);
+    repository.ensureDraft(100, 200, initialMaterials, "Тест");
+    expect(repository.hasDispatchLead(200)).toBe(true);
+    expect(repository.hasDispatchLead(201)).toBe(false);
+  });
+
   it("upgrades an existing version 1 database through every migration", () => {
     repository.db.exec("DROP TABLE warehouse_request_files");
     repository.db.exec("DROP TABLE warehouse_hidden_requests");
@@ -113,6 +120,9 @@ describe("WarehouseRepository", () => {
         size: 12345,
       }),
     ]);
+
+    repository.forgetRequestFile(100, "11111111-1111-4111-8111-111111111111");
+    expect(repository.requestFiles(100)).toEqual([]);
   });
 
   it("rejects a stale version", () => {

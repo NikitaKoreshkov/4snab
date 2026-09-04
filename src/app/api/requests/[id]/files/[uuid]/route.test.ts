@@ -4,14 +4,18 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const mocks = vi.hoisted(() => ({
   getUserByToken: vi.fn(),
   getRequestFile: vi.fn(),
+  detachRequestFile: vi.fn(),
   downloadDriveFile: vi.fn(),
 }));
 
 vi.mock("@/lib/auth", () => ({ getUserByToken: mocks.getUserByToken }));
-vi.mock("@/lib/requests", () => ({ getRequestFile: mocks.getRequestFile }));
+vi.mock("@/lib/requests", () => ({
+  getRequestFile: mocks.getRequestFile,
+  detachRequestFile: mocks.detachRequestFile,
+}));
 vi.mock("@/lib/amocrm", () => ({ downloadDriveFile: mocks.downloadDriveFile }));
 
-import { GET } from "./route";
+import { DELETE, GET } from "./route";
 
 const uuid = "11111111-1111-4111-8111-111111111111";
 const context = { params: Promise.resolve({ id: "123", uuid }) };
@@ -63,5 +67,19 @@ describe("invoice content proxy", () => {
     expect(mocks.downloadDriveFile).toHaveBeenCalledWith(
       "https://drive.example/download/preview.jpg",
     );
+  });
+
+  it("unlinks a waybill through amoCRM Files API", async () => {
+    mocks.detachRequestFile.mockResolvedValue(undefined);
+    const response = await DELETE(request(), context);
+    expect(response.status).toBe(200);
+    expect(mocks.detachRequestFile).toHaveBeenCalledWith(123, uuid);
+    expect(mocks.downloadDriveFile).not.toHaveBeenCalled();
+  });
+
+  it("rejects unauthorized deletes", async () => {
+    mocks.getUserByToken.mockReturnValue(null);
+    expect((await DELETE(request("bad"), context)).status).toBe(401);
+    expect(mocks.detachRequestFile).not.toHaveBeenCalled();
   });
 });

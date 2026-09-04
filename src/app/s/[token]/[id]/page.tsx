@@ -20,22 +20,26 @@ export default async function RequestPage({
   const requestId = Number(id);
   if (!Number.isInteger(requestId) || requestId <= 0) notFound();
 
+  const requestPromise = getRequest(requestId, user.name);
+  const filesPromise = listRequestFiles(requestId, { refresh: false }).catch((error) => {
+    console.error("RequestPage: не удалось получить накладные", error);
+    return null;
+  });
+
   let request;
   try {
-    request = await getRequest(requestId, user.name);
+    request = await requestPromise;
   } catch (error) {
     console.error("RequestPage", error);
     notFound();
   }
 
-  let files: RequestFile[] = [];
-  let filesError: string | undefined;
-  try {
-    files = await listRequestFiles(requestId);
-  } catch (error) {
-    console.error("RequestPage: не удалось получить накладные", error);
-    filesError = "Не удалось получить накладные. Проверьте доступ к файлам amoCRM.";
-  }
+  const filesOrNull = await filesPromise;
+  const files: RequestFile[] = filesOrNull ?? [];
+  const filesError =
+    filesOrNull === null
+      ? "Не удалось получить накладные. Проверьте доступ к файлам amoCRM."
+      : undefined;
 
   return (
     <main className="mx-auto max-w-3xl px-4 py-6">
@@ -123,6 +127,7 @@ export default async function RequestPage({
         id={request.id}
         initialFiles={files}
         initialError={filesError}
+        allowDelete={request.draft.status !== "completing"}
       />
 
       <RequestForm

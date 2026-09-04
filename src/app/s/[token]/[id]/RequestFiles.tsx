@@ -1,7 +1,7 @@
 "use client";
 
 import Image from "next/image";
-import { useEffect, useState, type ChangeEvent } from "react";
+import { useEffect, useState, type ChangeEvent, type DragEvent } from "react";
 import type { RequestFile } from "@/lib/requests";
 
 interface Props {
@@ -9,6 +9,7 @@ interface Props {
   id: number;
   initialFiles: RequestFile[];
   initialError?: string;
+  allowDelete?: boolean;
 }
 
 interface UploadSession {
@@ -53,13 +54,21 @@ async function responseError(response: Response, fallback: string): Promise<Erro
   return new Error(fallback);
 }
 
-export function RequestFiles({ token, id, initialFiles, initialError }: Props) {
+export function RequestFiles({
+  token,
+  id,
+  initialFiles,
+  initialError,
+  allowDelete = true,
+}: Props) {
   const [files, setFiles] = useState<RequestFile[]>(initialFiles);
   const [uploading, setUploading] = useState(false);
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState<string | null>(initialError ?? null);
   const [notice, setNotice] = useState<string | null>(null);
   const [preview, setPreview] = useState<RequestFile | null>(null);
+  const [dragOver, setDragOver] = useState(false);
+  const [deleting, setDeleting] = useState<string | null>(null);
 
   const endpoint = `/api/requests/${id}/files?token=${encodeURIComponent(token)}`;
 
@@ -143,9 +152,7 @@ export function RequestFiles({ token, id, initialFiles, initialError }: Props) {
     throw new Error(`Не удалось завершить загрузку «${file.name}»`);
   }
 
-  async function handleFiles(event: ChangeEvent<HTMLInputElement>) {
-    const selected = [...(event.target.files ?? [])];
-    event.target.value = "";
+  async function uploadMany(selected: File[]) {
     if (!selected.length) return;
 
     setUploading(true);
@@ -173,32 +180,90 @@ export function RequestFiles({ token, id, initialFiles, initialError }: Props) {
     }
   }
 
+  async function handleFiles(event: ChangeEvent<HTMLInputElement>) {
+    const selected = [...(event.target.files ?? [])];
+    event.target.value = "";
+    await uploadMany(selected);
+  }
+
+  function handleDrop(event: DragEvent<HTMLElement>) {
+    event.preventDefault();
+    setDragOver(false);
+    if (uploading) return;
+    void uploadMany([...event.dataTransfer.files]);
+  }
+
+  async function removeFile(file: RequestFile) {
+    if (!allowDelete || deleting) return;
+    const confirmed = window.confirm(`Удалить накладную «${file.name}»?`);
+    if (!confirmed) return;
+
+    setDeleting(file.uuid);
+    setError(null);
+    setNotice(null);
+    try {
+      const response = await fetch(fileUrl(file), { method: "DELETE" });
+      if (!response.ok) throw await responseError(response, "Не удалось удалить накладную");
+      setFiles((current) => current.filter((item) => item.uuid !== file.uuid));
+      if (preview?.uuid === file.uuid) setPreview(null);
+      setNotice("Накладная удалена");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Не удалось удалить накладную");
+    } finally {
+      setDeleting(null);
+    }
+  }
+
   return (
     <section className="mb-6 rounded-xl border p-4">
-      <div className="flex items-start justify-between gap-4">
-        <div>
-          <div className="flex flex-wrap items-center gap-2">
-            <h2 className="font-medium">Накладные и фото</h2>
-            <span className="rounded-full bg-gray-100 px-2 py-0.5 text-xs font-medium text-gray-600">
-              {files.length}
-            </span>
-          </div>
-          <p className="mt-0.5 text-xs text-gray-500">
-            PDF или изображения, без ограничения по количеству
-          </p>
+      <div className="mb-3">
+        <div className="flex flex-wrap items-center gap-2">
+          <h2 className="font-medium">Накладные и фото</h2>
+          <span className="rounded-full bg-gray-100 px-2 py-0.5 text-xs font-medium text-gray-600">
+            {files.length}
+          </span>
         </div>
-        <label className="shrink-0 cursor-pointer rounded-lg bg-gray-900 px-3 py-2 text-sm font-medium text-white hover:bg-gray-800 has-disabled:cursor-wait has-disabled:opacity-60">
-          {uploading ? `Загрузка ${progress || 0}%` : "Добавить"}
-          <input
-            type="file"
-            multiple
-            accept="application/pdf,image/*,.heic,.heif"
-            disabled={uploading}
-            onChange={handleFiles}
-            className="sr-only"
-          />
-        </label>
+        <p className="mt-0.5 text-xs text-gray-500">
+          Одно поле: можно выбрать или перетащить сразу несколько PDF и фото
+        </p>
       </div>
+
+      <label
+        className={`flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed px-4 py-6 text-center transition ${
+          dragOver
+            ? "border-gray-900 bg-gray-50"
+            : "border-gray-300 bg-white hover:border-gray-400"
+        } ${uploading ? "pointer-events-none opacity-60" : ""}`}
+        onDragEnter={(event) => {
+          event.preventDefault();
+          setDragOver(true);
+        }}
+        onDragOver={(event) => {
+          event.preventDefault();
+          setDragOver(true);
+        }}
+        onDragLeave={(event) => {
+          event.preventDefault();
+          if (event.currentTarget.contains(event.relatedTarget as Node)) return;
+          setDragOver(false);
+        }}
+        onDrop={handleDrop}
+      >
+        <input
+          type="file"
+          multiple
+          accept="application/pdf,image/*,.heic,.heif"
+          disabled={uploading}
+          onChange={handleFiles}
+          className="sr-only"
+        />
+        <span className="text-sm font-medium text-gray-800">
+          {uploading ? `Загрузка ${progress || 0}%` : "Нажмите или перетащите файлы сюда"}
+        </span>
+        <span className="mt-1 text-xs text-gray-400">
+          Несколько накладных за раз, без ограничения по количеству
+        </span>
+      </label>
 
       <div aria-live="polite">
         {error && (
@@ -215,8 +280,9 @@ export function RequestFiles({ token, id, initialFiles, initialError }: Props) {
         <ul className="mt-4 grid gap-3 sm:grid-cols-2">
           {files.map((file, index) => {
             const image = isPreviewableImage(file);
+            const busy = deleting === file.uuid;
             return (
-              <li key={file.uuid} className="overflow-hidden rounded-xl border bg-white">
+              <li key={file.uuid} className="relative overflow-hidden rounded-xl border bg-white">
                 {image ? (
                   <button
                     type="button"
@@ -251,6 +317,17 @@ export function RequestFiles({ token, id, initialFiles, initialError }: Props) {
                     </span>
                   </a>
                 )}
+                {allowDelete && (
+                  <button
+                    type="button"
+                    onClick={() => void removeFile(file)}
+                    disabled={busy || uploading}
+                    className="absolute top-2 right-2 rounded-full bg-black/70 px-2.5 py-1 text-xs font-medium text-white hover:bg-black disabled:opacity-50"
+                    aria-label={`Удалить ${file.name}`}
+                  >
+                    {busy ? "…" : "Удалить"}
+                  </button>
+                )}
                 <div className="flex items-start justify-between gap-3 p-3 text-sm">
                   <div className="min-w-0">
                     <p className="truncate font-medium" title={file.name}>
@@ -272,12 +349,9 @@ export function RequestFiles({ token, id, initialFiles, initialError }: Props) {
           })}
         </ul>
       ) : (
-        <div className="mt-4 rounded-xl border border-dashed bg-gray-50 px-4 py-6 text-center">
-          <p className="text-sm font-medium text-gray-600">Накладных пока нет</p>
-          <p className="mt-1 text-xs text-gray-400">
-            После загрузки они появятся здесь с именем и предпросмотром
-          </p>
-        </div>
+        <p className="mt-3 text-center text-xs text-gray-400">
+          После загрузки накладные появятся здесь с превью и кнопкой удаления
+        </p>
       )}
 
       {preview && (
@@ -295,6 +369,16 @@ export function RequestFiles({ token, id, initialFiles, initialError }: Props) {
             <div className="flex items-center justify-between gap-3 border-b px-4 py-3">
               <p className="min-w-0 truncate text-sm font-medium">{preview.name}</p>
               <div className="flex shrink-0 items-center gap-3">
+                {allowDelete && (
+                  <button
+                    type="button"
+                    onClick={() => void removeFile(preview)}
+                    disabled={deleting === preview.uuid}
+                    className="text-sm font-medium text-red-700 hover:underline disabled:opacity-50"
+                  >
+                    Удалить
+                  </button>
+                )}
                 <a
                   href={fileUrl(preview)}
                   target="_blank"

@@ -3,16 +3,20 @@ import "server-only";
 import { env, requireId } from "./env";
 import {
   addLeadTag,
+  countLeadsByPipeline,
   createLead,
+  findLeadsByCustomField,
   getLead,
   getLeadFileLinks,
   getLeadLinks,
+  getLeadsByIds,
   leadHasTag,
   linkFilesToLead,
   linkLeads,
   listLeadFiles,
   listLeadsByPipeline,
   readFieldValues,
+  unlinkFilesFromLead,
   updateLead,
   type AmoFieldInputValue,
   type AmoFile,
@@ -104,17 +108,34 @@ async function requireDispatchLead(id: number): Promise<AmoLead> {
   return lead;
 }
 
+function isDispatchLead(lead: AmoLead): boolean {
+  const pipelineId = Number(
+    requireId(env.pipelines.dispatchId, "AMOCRM_DISPATCH_PIPELINE_ID"),
+  );
+  return lead.pipeline_id === pipelineId;
+}
+
 async function resolveDispatchSource(
   skladLead: AmoLead,
+  preloaded?: Map<number, AmoLead>,
 ): Promise<{ id: number; lead: AmoLead } | null> {
   const explicitId = explicitSourceDispatchLeadId(skladLead);
-  if (explicitId) return { id: explicitId, lead: await requireDispatchLead(explicitId) };
+  if (explicitId) {
+    const cached = preloaded?.get(explicitId);
+    if (cached) return isDispatchLead(cached) ? { id: explicitId, lead: cached } : null;
+    return { id: explicitId, lead: await requireDispatchLead(explicitId) };
+  }
 
   // Старые заявки могли быть созданы до появления явного поля источника.
   try {
     const links = await getLeadLinks(skladLead.id);
     for (const link of links) {
       if (link.to_entity_type !== "leads") continue;
+      const cached = preloaded?.get(link.to_entity_id);
+      if (cached) {
+        if (isDispatchLead(cached)) return { id: cached.id, lead: cached };
+        continue;
+      }
       try {
         const lead = await requireDispatchLead(link.to_entity_id);
         return { id: lead.id, lead };
@@ -205,8 +226,21 @@ async function syncFilesToLead(targetLeadId: number, fileUuids: string[]): Promi
   if (missing.length) await linkFilesToLead(targetLeadId, missing);
 }
 
-async function hydrateRequest(skladLead: AmoLead, actor: string): Promise<ShipmentRequest> {
-  const resolvedSource = await resolveDispatchSource(skladLead);
+async function hydrateRequest(
+  skladLead: AmoLead,
+  actor: string,
+  options: { preloadedSources?: Map<number, AmoLead>; mode?: "list" | "detail" } = {},
+): Promise<ShipmentRequest> {
+  const mode = options.mode ?? "detail";
+  const resolvedSource =
+    mode === "list"
+      ? (() => {
+          const explicitId = explicitSourceDispatchLeadId(skladLead);
+          if (!explicitId) return null;
+          const cached = options.preloadedSources?.get(explicitId);
+          return { id: explicitId, lead: cached ?? skladLead };
+        })()
+      : await resolveDispatchSource(skladLead, options.preloadedSources);
   const sourceLeadId = resolvedSource?.id ?? null;
   const sourceLead = resolvedSource?.lead ?? skladLead;
   const materials = sourceMaterials(sourceLead, fieldId(env.fields.material));
@@ -220,7 +254,11 @@ async function hydrateRequest(skladLead: AmoLead, actor: string): Promise<Shipme
     draft = amoIsDone ? legacyDraft(materials) : unlinkedDraft(materials);
   } else {
     draft = repository.getDraft(skladLead.id);
-    if (amoIsDone) {
+    if (mode === "list") {
+      if (!draft.exists) {
+        draft = amoIsDone ? legacyDraft(materials) : unlinkedDraft(materials);
+      }
+    } else if (amoIsDone) {
       if (!draft.exists) {
         draft = legacyDraft(materials);
       } else if (draft.status !== "completed") {
@@ -277,7 +315,12 @@ async function mapWithConcurrency<T, R>(
 
 // ── Чтение ────────────────────────────────────────────────────────────
 
-export async function listRequests(actor = "warehouse-view"): Promise<ShipmentRequest[]> {
+export type RequestListScope = "open" | "done";
+
+export async function listRequests(
+  actor = "warehouse-view",
+  options: { scope?: RequestListScope } = {},
+): Promise<ShipmentRequest[]> {
   const pipelineId = Number(requireId(env.pipelines.skladId, "AMOCRM_SKLAD_PIPELINE_ID"));
   const newStatusId = Number(
     requireId(env.pipelines.skladNewStatusId, "AMOCRM_SKLAD_NEW_STATUS_ID"),
@@ -285,20 +328,46 @@ export async function listRequests(actor = "warehouse-view"): Promise<ShipmentRe
   const doneStatusId = Number(
     requireId(env.pipelines.skladDoneStatusId, "AMOCRM_SKLAD_DONE_STATUS_ID"),
   );
-  const [newLeads, doneLeads] = await Promise.all([
-    listLeadsByPipeline(pipelineId, newStatusId),
-    listLeadsByPipeline(pipelineId, doneStatusId),
-  ]);
+  const scope = options.scope ?? "open";
+  const statusId = scope === "done" ? doneStatusId : newStatusId;
+  const leads = await listLeadsByPipeline(pipelineId, statusId);
   const hiddenLeadIds = getWarehouseRepository().hiddenLeadIds();
-  const leads = [
-    ...new Map([...newLeads, ...doneLeads].map((lead) => [lead.id, lead])).values(),
-  ].filter((lead) => !hiddenLeadIds.has(lead.id));
-  const requests = await mapWithConcurrency(leads, 3, (lead) =>
-    hydrateRequest(lead, actor),
+  const visible = [...new Map(leads.map((lead) => [lead.id, lead])).values()].filter(
+    (lead) => !hiddenLeadIds.has(lead.id),
   );
+  const materialField = fieldId(env.fields.material);
+  const sourceIds = visible
+    .filter((lead) => sourceMaterials(lead, materialField).length === 0)
+    .map((lead) => explicitSourceDispatchLeadId(lead))
+    .filter((id): id is number => id !== null);
+  const preloadedSources = new Map(
+    (await getLeadsByIds(sourceIds)).map((lead) => [lead.id, lead]),
+  );
+
+  const requests = await mapWithConcurrency(visible, 8, (lead) =>
+    hydrateRequest(lead, actor, { mode: "list", preloadedSources }),
+  );
+  if (scope === "done") {
+    return requests.sort((left, right) =>
+      (right.draft.completedAt ?? right.createdAt).localeCompare(
+        left.draft.completedAt ?? left.createdAt,
+      ),
+    );
+  }
   return requests.sort((a, b) =>
     (a.shipDate ?? "9999").localeCompare(b.shipDate ?? "9999"),
   );
+}
+
+export async function countRequests(scope: RequestListScope): Promise<number> {
+  const pipelineId = Number(requireId(env.pipelines.skladId, "AMOCRM_SKLAD_PIPELINE_ID"));
+  const statusId = Number(
+    requireId(
+      scope === "done" ? env.pipelines.skladDoneStatusId : env.pipelines.skladNewStatusId,
+      scope === "done" ? "AMOCRM_SKLAD_DONE_STATUS_ID" : "AMOCRM_SKLAD_NEW_STATUS_ID",
+    ),
+  );
+  return countLeadsByPipeline(pipelineId, statusId);
 }
 
 export async function getRequest(
@@ -308,13 +377,18 @@ export async function getRequest(
   if (getWarehouseRepository().hiddenLeadIds().has(id)) {
     throw new Error("Складская заявка скрыта");
   }
-  return hydrateRequest(await getSkladLead(id), actor);
+  return hydrateRequest(await getSkladLead(id), actor, { mode: "detail" });
 }
 
-export async function listRequestFiles(id: number): Promise<RequestFile[]> {
+export async function listRequestFiles(
+  id: number,
+  options: { refresh?: boolean } = {},
+): Promise<RequestFile[]> {
   await getSkladLead(id);
   const repository = getWarehouseRepository();
   const cached = repository.requestFiles(id).map(storedRequestFile);
+  if (cached.length && options.refresh === false) return cached;
+
   let remote: RequestFile[] = [];
   try {
     const amoFiles = await listLeadFiles(id);
@@ -365,6 +439,37 @@ export async function attachUploadedFileToRequest(
   return attached;
 }
 
+/** Отвязывает накладную от складской сделки и, если уже передана, от сделки диспетчера. */
+export async function detachRequestFile(id: number, uuid: string): Promise<void> {
+  const lead = await getSkladLead(id);
+  const cached = getWarehouseRepository()
+    .requestFiles(id)
+    .some((file) => file.uuid === uuid);
+  if (!cached) {
+    const linked = (await getLeadFileLinks(id)).some((file) => file.file_uuid === uuid);
+    if (!linked) throw new Error("Накладная не привязана к этой заявке");
+  }
+
+  await unlinkFilesFromLead(id, [uuid]);
+  const draft = getWarehouseRepository().getDraft(id);
+  const doneStatusId = Number(
+    requireId(env.pipelines.skladDoneStatusId, "AMOCRM_SKLAD_DONE_STATUS_ID"),
+  );
+  const alreadyHandedOff =
+    lead.status_id === doneStatusId || draft.status === "completed";
+  if (!alreadyHandedOff) {
+    const source = await resolveDispatchSource(lead);
+    if (source) {
+      try {
+        await unlinkFilesFromLead(source.id, [uuid]);
+      } catch (error) {
+        console.warn("detachRequestFile: не удалось отвязать файл от диспетчера", error);
+      }
+    }
+  }
+  getWarehouseRepository().forgetRequestFile(id, uuid);
+}
+
 // ── Создание из сделки диспетчера (вебхук) ────────────────────────────
 
 function carryField(source: AmoLead, id: number | null): CustomFieldInput | null {
@@ -413,18 +518,17 @@ export async function createSkladRequestFromDispatch(
     custom_fields_values: carryOver,
   });
 
-  try {
-    await addLeadTag(dispatchLeadId, env.processedTag);
-  } catch {
-    // Тег — дополнительная защита от дублей; явное поле источника остаётся главным.
-  }
-  try {
-    await linkLeads(created.id, dispatchLeadId);
-  } catch {
-    // Нативная связь сделок доступна не во всех аккаунтах.
-  }
+  await Promise.all([
+    Promise.resolve(addLeadTag(dispatchLeadId, env.processedTag)).catch(() => undefined),
+    Promise.resolve(linkLeads(created.id, dispatchLeadId)).catch(() => undefined),
+  ]);
 
-  const createdLead = await getLead(created.id);
+  const createdLead: AmoLead = {
+    ...created,
+    custom_fields_values: created.custom_fields_values?.length
+      ? created.custom_fields_values
+      : carryOver,
+  };
   try {
     getWarehouseRepository().ensureDraft(
       created.id,
@@ -435,17 +539,24 @@ export async function createSkladRequestFromDispatch(
   } catch (error) {
     console.error("Не удалось заранее создать складской черновик", error);
   }
-  return hydrateRequest(createdLead, "amo-webhook");
+  return hydrateRequest(createdLead, "amo-webhook", {
+    mode: "detail",
+    preloadedSources: new Map([[dispatchLeadId, source]]),
+  });
 }
 
 export async function skladRequestExistsFor(dispatchLeadId: number): Promise<boolean> {
+  if (getWarehouseRepository().hasDispatchLead(dispatchLeadId)) return true;
   if (await leadHasTag(dispatchLeadId, env.processedTag)) return true;
   const pipelineId = Number(requireId(env.pipelines.skladId, "AMOCRM_SKLAD_PIPELINE_ID"));
   const sourceFieldId = requiredFieldId(env.fields.sourceLead, "AMOCRM_FIELD_SOURCE_LEAD");
-  const leads = await listLeadsByPipeline(pipelineId);
-  return leads.some(
-    (lead) => sourceNumber(lead, sourceFieldId) === dispatchLeadId,
-  );
+  const matches = await findLeadsByCustomField({
+    pipelineId,
+    fieldId: sourceFieldId,
+    value: dispatchLeadId,
+    limit: 1,
+  });
+  return matches.some((lead) => sourceNumber(lead, sourceFieldId) === dispatchLeadId);
 }
 
 // ── Сохранение и завершение ──────────────────────────────────────────

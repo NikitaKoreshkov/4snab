@@ -2,7 +2,7 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import { getUserByToken } from "@/lib/auth";
 import { formatDate, formatMoney } from "@/lib/format";
-import { listRequests, type ShipmentRequest } from "@/lib/requests";
+import { countRequests, listRequests, type ShipmentRequest } from "@/lib/requests";
 
 export const dynamic = "force-dynamic";
 
@@ -78,18 +78,15 @@ export default async function RequestsListPage({
   const user = getUserByToken(token);
   if (!user) notFound();
 
-  const requests = await listRequests(user.name);
-  const open = requests.filter((request) => !request.isDone);
-  const done = requests
-    .filter((request) => request.isDone)
-    .sort((left, right) =>
-      (right.draft.completedAt ?? right.createdAt).localeCompare(
-        left.draft.completedAt ?? left.createdAt,
-      ),
-    );
   const historySelected = query.view === "history";
   const completed = query.completed === "1";
-  const visible = historySelected ? done : open;
+  const [requests, otherCount] = await Promise.all([
+    listRequests(user.name, { scope: historySelected ? "done" : "open" }),
+    countRequests(historySelected ? "open" : "done").catch(() => 0),
+  ]);
+  const openCount = historySelected ? otherCount : requests.length;
+  const doneCount = historySelected ? requests.length : otherCount;
+  const visible = requests;
 
   return (
     <main className="mx-auto max-w-3xl px-4 py-6">
@@ -105,7 +102,7 @@ export default async function RequestsListPage({
             !historySelected ? "bg-white text-gray-900 shadow-sm" : "text-gray-500 hover:text-gray-900"
           }`}
         >
-          В работе ({open.length})
+          В работе ({openCount})
         </Link>
         <Link
           href={`/s/${token}?view=history`}
@@ -113,7 +110,7 @@ export default async function RequestsListPage({
             historySelected ? "bg-white text-gray-900 shadow-sm" : "text-gray-500 hover:text-gray-900"
           }`}
         >
-          История ({done.length})
+          История ({doneCount})
         </Link>
       </nav>
 
