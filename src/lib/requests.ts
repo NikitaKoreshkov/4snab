@@ -2,6 +2,15 @@
 import "server-only";
 import { env, requireId } from "./env";
 import {
+  demoCountRequests,
+  demoDetachRequestFile,
+  demoGetRequest,
+  demoListRequestFiles,
+  demoListRequests,
+  demoSaveRequest,
+  isDemoMode,
+} from "./demoStore";
+import {
   addLeadTag,
   countLeadsByPipeline,
   createLead,
@@ -321,6 +330,7 @@ export async function listRequests(
   actor = "warehouse-view",
   options: { scope?: RequestListScope } = {},
 ): Promise<ShipmentRequest[]> {
+  if (isDemoMode()) return demoListRequests(options.scope ?? "open");
   const pipelineId = Number(requireId(env.pipelines.skladId, "AMOCRM_SKLAD_PIPELINE_ID"));
   const newStatusId = Number(
     requireId(env.pipelines.skladNewStatusId, "AMOCRM_SKLAD_NEW_STATUS_ID"),
@@ -360,6 +370,7 @@ export async function listRequests(
 }
 
 export async function countRequests(scope: RequestListScope): Promise<number> {
+  if (isDemoMode()) return demoCountRequests(scope);
   const pipelineId = Number(requireId(env.pipelines.skladId, "AMOCRM_SKLAD_PIPELINE_ID"));
   const statusId = Number(
     requireId(
@@ -374,6 +385,7 @@ export async function getRequest(
   id: number,
   actor = "warehouse-view",
 ): Promise<ShipmentRequest> {
+  if (isDemoMode()) return demoGetRequest(id);
   if (getWarehouseRepository().hiddenLeadIds().has(id)) {
     throw new Error("Складская заявка скрыта");
   }
@@ -384,6 +396,7 @@ export async function listRequestFiles(
   id: number,
   options: { refresh?: boolean } = {},
 ): Promise<RequestFile[]> {
+  if (isDemoMode()) return demoListRequestFiles(id);
   await getSkladLead(id);
   const repository = getWarehouseRepository();
   const cached = repository.requestFiles(id).map(storedRequestFile);
@@ -409,6 +422,7 @@ export async function listRequestFiles(
 }
 
 export async function getRequestFile(id: number, uuid: string): Promise<RequestFile> {
+  if (isDemoMode()) throw new Error("В демо-режиме накладные не выдаются");
   const cached = getWarehouseRepository()
     .requestFiles(id)
     .find((candidate) => candidate.uuid === uuid);
@@ -424,6 +438,7 @@ export async function attachUploadedFileToRequest(
   id: number,
   file: AmoFile,
 ): Promise<RequestFile> {
+  if (isDemoMode()) throw new Error("В демо-режиме загрузка файлов отключена");
   const lead = await getSkladLead(id);
   await syncFilesToLead(id, [file.uuid]);
   const draft = getWarehouseRepository().getDraft(id);
@@ -441,6 +456,10 @@ export async function attachUploadedFileToRequest(
 
 /** Отвязывает накладную от складской сделки и, если уже передана, от сделки диспетчера. */
 export async function detachRequestFile(id: number, uuid: string): Promise<void> {
+  if (isDemoMode()) {
+    demoDetachRequestFile(id, uuid);
+    return;
+  }
   const lead = await getSkladLead(id);
   const cached = getWarehouseRepository()
     .requestFiles(id)
@@ -678,6 +697,7 @@ export async function saveWarehouseRequest(
   input: SaveWarehouseRequestInput,
   actor: string,
 ): Promise<ShipmentRequest> {
+  if (isDemoMode()) return demoSaveRequest(id, input, actor);
   const skladLead = await getSkladLead(id);
   const request = await hydrateRequest(skladLead, actor);
   if (request.syncIssue) throw new WarehouseValidationError(request.syncIssue);

@@ -2,6 +2,7 @@
 // Список пользователей задаётся в WAREHOUSE_USERS:  token:Имя,token2:Имя2
 import "server-only";
 import { env } from "./env";
+import { DEMO_TOKEN, DEMO_USER_NAME, isDemoMode } from "./demoStore";
 
 export interface WarehouseUser {
   token: string;
@@ -10,7 +11,9 @@ export interface WarehouseUser {
 
 function parseUsers(): WarehouseUser[] {
   const raw = env.warehouseUsersRaw;
-  if (!raw) return [];
+  if (!raw) {
+    return isDemoMode() ? [{ token: DEMO_TOKEN, name: DEMO_USER_NAME }] : [];
+  }
   return raw
     .split(",")
     .map((pair) => pair.trim())
